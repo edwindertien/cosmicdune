@@ -4,6 +4,7 @@
 #include "drivers/gsr_sensor.h"
 #include "drivers/pulse_strip.h"
 #include "core/net_config.h"
+#include "core/pod_config.h"
 #include "net/osc_link.h"
 #include "io/cli.h"
 
@@ -53,6 +54,18 @@ void setup() {
   // If "[BOOT] LED strip ready" never appears, FastLED.addLeds() (in
   // pulse_strip.cpp) is hanging/panicking -- comment out the
   // pulseStrip.begin() line above and reflash to confirm.
+
+  // PodConfigStore::load() runs AFTER the two lines above so it overrides
+  // their compiled-in defaults, not the other way around -- GSR baseline
+  // itself is untouched either way (see pod_config.h for why it's not
+  // persisted).
+  PodConfigStore::begin();
+  if (PodConfigStore::load()) {
+    Serial.println(F("[BOOT] loaded /podconfig.json (GSR range/invert, strip mode/speed)"));
+  } else {
+    Serial.println(F("[BOOT] no /podconfig.json yet -- using config.h defaults "
+                      "(see CLI 'save' to persist current gsr/mode settings)"));
+  }
 
   Serial.println(F("[BOOT] mounting LittleFS for network config..."));
   NetConfigStore::begin();

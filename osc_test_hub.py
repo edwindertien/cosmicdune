@@ -30,6 +30,7 @@ Message format expected from each pod (see the firmware's src/net/osc_link.cpp):
 """
 import argparse
 import random
+import socket
 import sys
 import threading
 import time
@@ -38,6 +39,26 @@ from dataclasses import dataclass
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_server import ThreadingOSCUDPServer
 from pythonosc.udp_client import SimpleUDPClient
+
+
+def get_local_ip() -> str:
+    """Best-effort guess at this machine's LAN IP -- the one a pod on the
+    same network should be pointed at. Opens a UDP socket toward a public
+    address without actually sending anything; the OS resolves which
+    local interface/IP it would route through, which is the standard
+    trick for this and works even offline (falls back to 127.0.0.1).
+    On a machine with several active interfaces (WiFi + Ethernet, a VPN)
+    this picks whichever one the OS would use by default, which may not
+    be the one the pod is actually on -- double-check with
+    ipconfig/ifconfig if a pod still can't reach this."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 # A pod not heard from in this long is shown OFFLINE rather than just
 # displaying its last-known (increasingly stale) values -- roughly the
@@ -66,6 +87,9 @@ class Monitor:
 
     def __init__(self, port: int):
         self.port = port
+        self.local_ip = get_local_ip()  # cached once -- doesn't need
+                                          # recomputing every render() cycle,
+                                          # and IP shouldn't change mid-session
         self.pods: dict[int, PodState] = {}
         self.lock = threading.Lock()
 
@@ -112,6 +136,7 @@ class Monitor:
         # drop these two escapes and let it scroll instead.
         sys.stdout.write("\x1b[2J\x1b[H")
         print(f"cosmic dune -- OSC test hub, listening on UDP :{self.port}")
+        print(f"This machine's IP: {self.local_ip}  ->  on each pod: net hub {self.local_ip} {self.port}")
         print(f"{'pod':>4} {'age':>6} {'status':>8} {'bpm':>5} {'ibi(ms)':>8} "
               f"{'signal':>7} {'gsr raw':>8} {'gsr norm':>9}")
         if not rows:

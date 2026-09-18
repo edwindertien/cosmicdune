@@ -6,6 +6,7 @@
 #include "../drivers/gsr_sensor.h"
 #include "../drivers/pulse_strip.h"
 #include "../core/net_config.h"
+#include "../core/pod_config.h"
 #include "../net/osc_link.h"
 
 Cli cli;
@@ -219,13 +220,15 @@ void Cli::handleLine(const String& lineIn) {
       netConfig.password[sizeof(netConfig.password) - 1] = '\0';
       Serial.print(F("OK password set (")); Serial.print(val.length()); Serial.println(F(" chars)"));
 
-    } else if (a == "pod" && n >= 3) {
+    } else if (a == "pod") {
+      if (n < 3) { Serial.println(F("usage: net pod <1-6>")); return; }
       int id = atoi(tok[2]);
       if (id < 1 || id > 6) { Serial.println(F("usage: net pod <1-6>")); return; }
       netConfig.podId = (uint8_t)id;
       Serial.print(F("OK pod=")); Serial.println(id);
 
-    } else if (a == "hub" && n >= 4) {
+    } else if (a == "hub") {
+      if (n < 4) { Serial.println(F("usage: net hub <ip> <port>")); return; }
       IPAddress test;
       if (!test.fromString(tok[2])) { Serial.println(F("usage: net hub <ip> <port>")); return; }
       long port = atol(tok[3]);
@@ -235,7 +238,8 @@ void Cli::handleLine(const String& lineIn) {
       netConfig.hubPort = (uint16_t)port;
       Serial.print(F("OK hub=")); Serial.print(netConfig.hubHost); Serial.print(':'); Serial.println(netConfig.hubPort);
 
-    } else if (a == "rate" && n >= 3) {
+    } else if (a == "rate") {
+      if (n < 3) { Serial.println(F("usage: net rate <1-60>")); return; }
       int hz = atoi(tok[2]);
       if (hz < 1 || hz > 60) { Serial.println(F("usage: net rate <1-60>")); return; }
       netConfig.sendHz = (uint8_t)hz;
@@ -257,6 +261,13 @@ void Cli::handleLine(const String& lineIn) {
       Serial.println(F("usage: net | net ssid <name> | net pass <pass> | net pod <1-6> |"));
       Serial.println(F("       net hub <ip> <port> | net rate <1-60> | net enable|disable | net save"));
     }
+
+  } else if (cmd == "save") {
+    // Persists GSR range/invert + strip mode/speed -- NOT WiFi settings
+    // (see `net save` for those) and NOT GSR baseline (see `gsr` command's
+    // help -- it's deliberately never persisted).
+    bool ok = PodConfigStore::save();
+    Serial.println(ok ? F("OK saved to /podconfig.json") : F("ERR save failed"));
 
   } else if (cmd == "reboot") {
     Serial.println(F("Rebooting..."));
@@ -296,6 +307,9 @@ void Cli::printHelp() {
     "                         if it barely leaves white\n"
     "  gsr invert on|off      flip if sweat reads as ADC counts DOWN on your\n"
     "                         wiring instead of up\n"
+    "  save                   persist current GSR range/invert + strip\n"
+    "                         mode/speed to /podconfig.json (not baseline --\n"
+    "                         see 'gsr baseline'; not WiFi -- see 'net save')\n"
     "  net                    WiFi/OSC config + connection status (password\n"
     "                         never echoed, only whether one is set)\n"
     "  net ssid <name>        set the WiFi SSID (may contain spaces)\n"
