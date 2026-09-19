@@ -155,19 +155,25 @@ tools/requirements.txt`):
 ## Known unverified assumptions
 
 - **`board = rpipicow`** in `platformio.ini` -- see the note there.
-- **FastLED on RP2040**: chosen over Adafruit_NeoPixel specifically for its
-  PIO-based (not interrupt-disabling) WS2812 driver -- but the build log's
-  `"Forcing software SPI"` message from FastLED suggests this platform/pin
-  combination may not actually be taking that PIO path. Not confirmed
-  either way yet; see `context.md` for what to watch for.
+- **FastLED on RP2040**: resolved, not actually a concern -- the
+  `"Forcing software SPI"` build message is about FastLED's separate
+  *clocked SPI* output path (for chipsets like APA102 that need a clock
+  wire), compiled unconditionally regardless of chipset choice. WS2812B
+  (what we use) goes through FastLED's entirely different *clockless*
+  controller, and FastLED's own documented `FASTLED_ALLOW_INTERRUPTS`
+  default for RP2040 re-enables interrupts between pixels rather than
+  holding them off for the whole frame -- confirming the original reason
+  FastLED was picked over Adafruit_NeoPixel was correct.
 - **Grove ear-clip edge polarity** (FALLING) -- flip to RISING in
   `src/drivers/pulse_sensor.cpp` if beats don't register or double-count.
 - **GSR polarity and default range** -- both need calibrating per physical
   sensor/wearer; see the bring-up steps above.
-- **`lib_ldf_mode = off`** in `platformio.ini` requires every used library
-  to be listed explicitly in `lib_deps` -- if a future dependency needs
-  something not listed and the build fails with missing symbols rather
-  than a normal compile error, that's the sign to add it explicitly.
+- **`lib_ldf_mode = chain`** in `platformio.ini` (moved off `off`, which
+  turned out to also block discovery of framework-bundled headers like
+  `Wire.h`/`LittleFS.h`, not just third-party libraries) with
+  `lib_ignore = lwIP_ESPHost` alongside it, excluding one irrelevant WiFi
+  backend file that doesn't apply to this board (see `platformio.ini`'s
+  comment, and the confirmed upstream issue it links, for why).
 
 ## Deliberately deferred (not in this iteration)
 

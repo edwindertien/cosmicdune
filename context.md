@@ -64,21 +64,30 @@ ordering that was removed. If a literal MIDI output is wanted later
 (e.g. for a DAW), treat it as a fresh, isolated addition, not a
 revert.
 
-### FastLED's actual behavior on this platform is still an open question
+### FastLED's "Forcing software SPI" message -- resolved, was a false alarm
 
-FastLED was chosen over Adafruit_NeoPixel specifically because its native
-RP2040 support was believed to drive WS2812 via PIO without disabling
-interrupts -- important because beat detection is interrupt-driven, and
-Adafruit_NeoPixel's RP2040 driver is known to bit-bang with interrupts
-briefly disabled per frame. However, build logs have twice shown
-FastLED's own `"Forcing software SPI - no hardware accelerated SPI for
-you!"` pragma message for this board -- which suggests it may actually be
-falling back to a bit-banged path here, undermining the reason it was
-picked. Not yet confirmed either way. **Watch for it empirically**: if
-pulse timing gets visibly jittery specifically while WiFi is active and
-the strip is updating, this is the first thing to revisit (either dig
-into why FastLED thinks it needs software SPI for `WS2812B`/`rpipicow`,
-or switch to a different clockless RP2040 WS2812 approach).
+FastLED was chosen over Adafruit_NeoPixel specifically because it doesn't
+disable interrupts for the whole frame on RP2040 -- important because
+beat detection is interrupt-driven, and Adafruit_NeoPixel's RP2040 driver
+is known to bit-bang with interrupts held off per frame. Build logs
+repeatedly showed FastLED's `"Forcing software SPI - no hardware
+accelerated SPI for you!"` pragma message, which looked like it might be
+undermining that reasoning. It doesn't: that message is about FastLED's
+*clocked SPI* output path (for chipsets like APA102/DotStar that need a
+separate clock wire), which `fastspi.h` compiles unconditionally as part
+of `FastLED.h` regardless of which chipset a sketch actually uses. WS2812B
+(what we use) goes through FastLED's entirely separate *clockless*
+controller instead -- the message is boilerplate about a code path we
+never touch, not a statement about our actual LED output.
+
+The real, relevant guarantee is FastLED's own documented per-platform
+`FASTLED_ALLOW_INTERRUPTS` default: RP2040 is explicitly listed at the
+"interrupts re-enabled between pixels" setting (unlike AVR/STM32, which
+hold interrupts off for the entire frame). The pulse-sensor ISR just
+timestamps an edge -- a handful of instructions, far under WS2812's
+~30us-per-pixel budget -- so it's genuinely safe under this. FastLED was
+the right call; this just needed sourcing properly instead of staying
+flagged as an open question.
 
 ### Colour source moved from BPM to GSR
 
@@ -215,8 +224,6 @@ any workflow for keeping 6 physical pods' `net pod` ids straight.
 - Default `PulseMode` for actual performance use -- `ibi` (current
   default) or `fixed`? Needs eyes-on with real musicians, not a desk
   decision.
-- Whether FastLED is genuinely using PIO on this board (see above) --
-  worth settling before relying on tight pulse timing under WiFi load.
 - Laser control path: DMX (preset patterns, coarse) vs ILDA (via an
   external DAC, full custom vector control) for the CUBE 3 -- see the
   laser-control discussion for where this landed.
