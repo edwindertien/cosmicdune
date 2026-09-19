@@ -4,20 +4,23 @@ One of 6 wearable pods for the *cosmic dune* project: an artistic laser
 distress signal sent into the sky, triggered by 6 musicians' biosignals
 synchronizing. Each pod reads one musician's heart rate (ear-clip pulse
 sensor) and skin conductance (GSR), renders that live on a 250-LED strip
-worn on the body, and reports telemetry over WiFi (OSC) to a central hub.
-The hub (gathering all 6 pods and driving the Laserworld CUBE 3) is a
-separate, not-yet-built piece -- see `context.md` for where that stands.
+worn on the body and on an on-pod OLED display, and reports telemetry
+over WiFi (OSC) to a central hub. The hub (gathering all 6 pods and
+driving the Laserworld CUBE 3) is a separate, not-yet-built piece -- see
+`context.md` for where that stands.
 
 ## Wiring
 
 | Signal                            | Pico W pin  |
 |------------------------------------|-------------|
-| Grove ear-clip signal              | GP9         |
+| Grove ear-clip signal              | GP26        |
 | Grove ear-clip VCC / GND           | 3V3 / GND   |
 | GSR sensor signal                  | GP27 (ADC1) |
 | GSR sensor VCC / GND               | 3V3 / GND   |
-| LED strip data-in                  | GP6         |
+| LED strip data-in                  | GP17        |
 | LED strip 5V / GND                 | **external 5V supply, NOT the Pico** -- common GND back to the Pico |
+| OLED display (I2C0) SDA / SCL      | GP8 / GP9   |
+| M5Stack encoder (I2C1) SDA / SCL   | GP6 / GP7   |
 
 **Power, read this first:** 250x WS2812B at full white/full brightness is on
 the order of 15A @ 5V -- far beyond USB or a small onboard regulator. Feed
@@ -49,7 +52,8 @@ to end up with a file saved flat in `src/` instead of its subfolder.
 2. `status` -- confirms the CLI is alive; should print `bpm=0 ... signal=no
    mode=ibi gsr=... net=off`.
 3. `beat 72` -- injects one synthetic heartbeat. Confirms, with no sensors
-   attached at all, that a white/blue comet travels the strip once.
+   attached at all, that a white/blue comet travels the strip once, and
+   the OLED's beat circle flashes with a pulse-waveform blip.
 4. `beat 140 80` -- same, but with a synthetic 80% GSR level: the comet
    should read purple/red instead of white/blue (see `Config::gsrToColor`
    in `src/drivers/pulse_strip.cpp` to retune the gradient).
@@ -61,6 +65,7 @@ to end up with a file saved flat in `src/` instead of its subfolder.
 6. `gsr` -- watch the raw ADC count move as you rub your fingers together
    or relax. Set `gsr range <counts>` to whatever span actually takes you
    from white to red; `gsr invert on` if the colour runs backwards.
+7. Turn the encoder knob -- press it to open the on-pod menu (see below).
 
 ## CLI reference
 
@@ -77,8 +82,9 @@ reboot
 
 ### LED strip
 ```
-led brightness <0-255>   strip brightness (not persisted -- see config.h
-                          HW::STRIP_DEFAULT_BRIGHTNESS for the boot default)
+led brightness <0-255>   strip brightness (not persisted via CLI -- see
+                          `save` below, or config.h HW::STRIP_DEFAULT_
+                          BRIGHTNESS for the boot default)
 mode fixed|ibi            fixed = constant traversal speed regardless of
                           BPM (fast heart rate -> multiple pulses in flight
                           at once); ibi = one traversal per heartbeat,
@@ -134,6 +140,41 @@ Two separate config files, two separate save commands -- `net save` for
 WiFi (`/netconfig.json`), bare `save` for GSR/strip settings
 (`/podconfig.json`). GSR **baseline** is never persisted by either.
 
+## On-pod display and menu
+
+An SH1107 OLED (M5Stack "Unit OLED", 128x64, I2C0) shows a live monitor
+view when the menu isn't open:
+
+- A beat indicator circle (top-left) -- hollow with no signal, flashes
+  filled on each detected heartbeat.
+- A "faux" heartbeat trace next to it, with the current BPM as a number.
+  There's no raw analog waveform available from this sensor (it's a
+  digital comparator, not analog PPG) -- this is a small stylized blip
+  injected at the right edge and scrolled left once per *real* detected
+  beat, similar in spirit to a bedside monitor's sweep display. The
+  timing is genuine; the shape is synthetic.
+- A GSR trend graph below that, with the current raw ADC count as a
+  number next to it -- sampled roughly once a second (GSR moves on a
+  timescale of seconds, so this gives close to a minute of visible trend).
+- WiFi status/IP at the bottom.
+
+An M5Stack Unit Encoder (I2C1, addr 0x40) drives an on-pod settings menu
+over this same screen: rotate to navigate/adjust, short-press to
+select/confirm, long-press to exit to the monitor view from anywhere.
+Covers GSR range/invert/baseline-reset, strip mode/speed, brightness,
+WiFi status (SSID shown, password only as set/not-set) and hub IP/port
+(individually adjustable, since those are numeric), net enable, and
+saving either settings group (`Save Pod` / `Save WiFi`). Entering an SSID
+or password itself stays CLI-only -- typing free text with a rotary knob
+isn't good UX no matter how it's built.
+
+The menu is 17 items long, navigated as one flat scrolling list (not
+grouped into submenus). Worth watching in practice: if that's tedious to
+scroll through for routine adjustments, grouping related items behind a
+submenu (e.g. one "WiFi" entry that opens its own short list) would be
+the natural next step -- not built yet since it's unclear if the flat
+list is actually a problem until it's used hands-on.
+
 ## Testing the OSC link without the real hub
 
 `tools/` has two standalone Python scripts (`pip install -r
@@ -147,33 +188,36 @@ tools/requirements.txt`):
   real hub) can be developed and tested with zero physical hardware.
 - **`osc_web_dashboard.py`** -- a graphical alternative to `monitor`: a
   Flask web page with live BPM (fixed 30-180 scale) and GSR (fixed 0-1
-  scale) graphs per pod, plus the same status table (now including each
-  pod's source IP). Works with `osc_test_hub.py simulate` unchanged as a
-  test data source -- both just listen on the same UDP port. Runs fine on
-  a Raspberry Pi as well as a laptop (see `context.md`).
+  scale) graphs per pod, plus the same status table (including each pod's
+  source IP). Works with `osc_test_hub.py simulate` unchanged as a test
+  data source -- both just listen on the same UDP port. Runs fine on a
+  Raspberry Pi as well as a laptop.
 
 ## Known unverified assumptions
 
 - **`board = rpipicow`** in `platformio.ini` -- see the note there.
-- **FastLED on RP2040**: resolved, not actually a concern -- the
-  `"Forcing software SPI"` build message is about FastLED's separate
-  *clocked SPI* output path (for chipsets like APA102 that need a clock
-  wire), compiled unconditionally regardless of chipset choice. WS2812B
-  (what we use) goes through FastLED's entirely different *clockless*
-  controller, and FastLED's own documented `FASTLED_ALLOW_INTERRUPTS`
-  default for RP2040 re-enables interrupts between pixels rather than
-  holding them off for the whole frame -- confirming the original reason
-  FastLED was picked over Adafruit_NeoPixel was correct.
 - **Grove ear-clip edge polarity** (FALLING) -- flip to RISING in
   `src/drivers/pulse_sensor.cpp` if beats don't register or double-count.
 - **GSR polarity and default range** -- both need calibrating per physical
   sensor/wearer; see the bring-up steps above.
-- **`lib_ldf_mode = chain`** in `platformio.ini` (moved off `off`, which
-  turned out to also block discovery of framework-bundled headers like
-  `Wire.h`/`LittleFS.h`, not just third-party libraries) with
-  `lib_ignore = lwIP_ESPHost` alongside it, excluding one irrelevant WiFi
+- **Encoder rotation direction** -- `M5Encoder::readSteps()` returns
+  positive for clockwise, ported from a previous project's assumption but
+  not independently reconfirmed on this exact unit. If menu navigation
+  feels backwards, flip the sign where it's consumed in `src/io/menu.cpp`.
+- **`lib_ldf_mode = chain`** in `platformio.ini`, with
+  `lib_ignore = lwIP_ESPHost` alongside it to exclude one irrelevant WiFi
   backend file that doesn't apply to this board (see `platformio.ini`'s
   comment, and the confirmed upstream issue it links, for why).
+
+**Resolved, not concerns (kept here briefly since both looked like real
+problems at first):** FastLED's `"Forcing software SPI"` build message is
+about a code path (clocked SPI chipsets) we never use -- WS2812B goes
+through FastLED's separate clockless controller, and RP2040 is confirmed
+(FastLED's own docs) to re-enable interrupts between pixels rather than
+holding them off for the whole frame. And the SH1107's `(64, 128)`
+constructor argument order plus `setRotation(1)` in `display.cpp`'s
+`begin()` are a real, confirmed-working pair for this exact 128x64
+panel, not a mismatched typo -- see `context.md` for the full story on both.
 
 ## Deliberately deferred (not in this iteration)
 
@@ -188,3 +232,4 @@ tools/requirements.txt`):
 - **Per-pod physical labeling/workflow** for assigning and tracking which
   of the 6 physical pods has which `net pod <id>` -- currently manual and
   easy to get wrong across 6 units.
+- **Menu grouping/submenus** -- see "On-pod display and menu" above.

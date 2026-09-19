@@ -14,7 +14,7 @@
 // cosmic dune -- sensor pod firmware, iteration 1e:
 //   Grove ear-clip pulse (GP26) sets the travelling pulse's speed/tempo;
 //   GSR (GP27) sets its colour (white -> blue -> purple -> red). Both
-//   render on the 250-LED strip (GP10). Telemetry (bpm/ibi/signal/gsr)
+//   render on the 250-LED strip (GP17). Telemetry (bpm/ibi/signal/gsr)
 //   goes out over WiFi as OSC to a hub, once configured via the CLI's
 //   `net` commands. An SH1107 OLED (I2C0, GP8/GP9) shows a live
 //   beat-flash + BPM graph + WiFi status, and an M5Stack encoder (I2C1,
@@ -45,7 +45,7 @@ void setup() {
   gsrSensor.begin(HW::GSR_PIN);
   Serial.print(F("[BOOT] GSR baseline=")); Serial.println(gsrSensor.baseline());
 
-  Serial.println(F("[BOOT] starting LED strip (FastLED, GP10, 250 LEDs)..."));
+  Serial.println(F("[BOOT] starting LED strip (FastLED, GP17, 250 LEDs)..."));
   pulseStrip.begin();
   Serial.println(F("[BOOT] LED strip ready"));
   // If "[BOOT] LED strip ready" never appears, FastLED.addLeds() (in

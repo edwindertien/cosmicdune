@@ -28,11 +28,12 @@ namespace HW {
   // independently.
   static constexpr uint8_t GSR_PIN = 27; // GP27 / ADC1
 
-  // WS2812B-style ("neopixel") strip, 5m @ 50 LED/m. Moved from GP6 to
-  // GP10 -- GP6 is now I2C1 SDA (below). FastLED's PIO-based driver isn't
-  // tied to specific pins the way I2C/SPI hardware peripherals are, so
-  // this move is just a constant change, nothing structural.
-  static constexpr uint8_t  STRIP_PIN                = 17;  // GP10
+  // WS2812B-style ("neopixel") strip, 5m @ 50 LED/m. Originally moved
+  // from GP6 to GP10 when GP6 became I2C1 SDA, then wired to GP17 on the
+  // physical build instead. FastLED's PIO-based driver isn't tied to
+  // specific pins the way I2C/SPI hardware peripherals are, so this is
+  // just a constant change, nothing structural.
+  static constexpr uint8_t  STRIP_PIN                = 17;  // GP17
   static constexpr uint16_t STRIP_NUM_LEDS           = 250;
   static constexpr uint8_t  STRIP_DEFAULT_BRIGHTNESS = 120; // 0-255, FastLED global scale
   // POWER BUDGET, READ BEFORE FIRST POWER-ON: 250x WS2812B at full white,
