@@ -44,7 +44,7 @@ private:
     ItemKind    kind;
   };
 
-  static constexpr uint8_t NUM_ITEMS = 17;
+  static constexpr uint8_t NUM_ITEMS = 19;
   static const Item ITEMS[NUM_ITEMS];
 
   State    _state = State::CLOSED;

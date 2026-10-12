@@ -9,6 +9,7 @@
 #include "../drivers/pulse_strip.h"
 #include "../core/pod_config.h"
 #include "../core/net_config.h"
+#include "../net/osc_link.h"
 
 Menu menu;
 
@@ -21,12 +22,14 @@ const Menu::Item Menu::ITEMS[Menu::NUM_ITEMS] = {
   { "Brightness",   ItemKind::VALUE  },
   { "WiFi SSID",    ItemKind::INFO   },
   { "WiFi WPA",     ItemKind::INFO   },
+  { "WiFi Status",  ItemKind::INFO   },
   { "Hub IP.1",     ItemKind::VALUE  },
   { "Hub IP.2",     ItemKind::VALUE  },
   { "Hub IP.3",     ItemKind::VALUE  },
   { "Hub IP.4",     ItemKind::VALUE  },
   { "Hub Port",     ItemKind::VALUE  },
   { "Net Enable",   ItemKind::TOGGLE },
+  { "Net Retry",    ItemKind::ACTION },
   { "Save Pod",     ItemKind::ACTION },
   { "Save WiFi",    ItemKind::ACTION },
   { "Exit",         ItemKind::ACTION },
@@ -52,6 +55,19 @@ static void setHubOctet(uint8_t index, uint8_t value) {
   String s = ip.toString();
   strncpy(netConfig.hubHost, s.c_str(), sizeof(netConfig.hubHost) - 1);
   netConfig.hubHost[sizeof(netConfig.hubHost) - 1] = '\0';
+}
+
+// Mirrors cli.cpp's wifiStateText() -- kept as a separate small copy
+// rather than shared, since the two have different string-length budgets
+// (this one is truncated to 6 chars in the list view anyway) and menu.cpp
+// already doesn't share code with cli.cpp for anything else.
+static String wifiStateText() {
+  switch (oscLink.state()) {
+    case NetLinkState::CONNECTED:  return String(F("up"));
+    case NetLinkState::CONNECTING: return String(F("trying"));
+    case NetLinkState::GAVE_UP:    return String(F("gaveup"));
+    default:                        return String(F("off"));
+  }
 }
 
 void Menu::begin() {
@@ -131,21 +147,22 @@ void Menu::applyDelta(uint8_t itemIndex, int16_t delta) {
       pulseStrip.setBrightness((uint8_t)v);
       break;
     }
-    // 6, 7 = WiFi SSID / WPA -- INFO, read-only, no case needed (falls to default)
-    case 8: case 9: case 10: case 11: { // Hub IP octets
-      uint8_t octetIdx = (uint8_t)(itemIndex - 8);
+    // 6, 7, 8 = WiFi SSID / WPA / Status -- INFO, read-only, no case
+    // needed (falls to default)
+    case 9: case 10: case 11: case 12: { // Hub IP octets
+      uint8_t octetIdx = (uint8_t)(itemIndex - 9);
       int32_t v = (int32_t)getHubOctet(octetIdx) + delta;
       v = constrain(v, 0, 255);
       setHubOctet(octetIdx, (uint8_t)v);
       break;
     }
-    case 12: { // Hub Port
+    case 13: { // Hub Port
       int32_t v = (int32_t)netConfig.hubPort + delta;
       v = constrain(v, 1, 65535);
       netConfig.hubPort = (uint16_t)v;
       break;
     }
-    case 13: // Net Enable -- toggle
+    case 14: // Net Enable -- toggle
       netConfig.enabled = !netConfig.enabled;
       break;
     default:
@@ -160,15 +177,20 @@ void Menu::performAction(uint8_t itemIndex) {
       gsrSensor.calibrateBaselineNow();
       _actionConfirmUntilMs = millis() + 600;
       break;
-    case 14: // Save Pod (GSR range/invert + strip mode/speed -> /podconfig.json)
+    case 15: // Net Retry -- see net/osc_link.h for why WiFi doesn't just
+              // keep auto-retrying forever on its own
+      oscLink.retry();
+      _actionConfirmUntilMs = millis() + 600;
+      break;
+    case 16: // Save Pod (GSR range/invert + strip mode/speed -> /podconfig.json)
       PodConfigStore::save();
       _actionConfirmUntilMs = millis() + 600;
       break;
-    case 15: // Save WiFi (-> /netconfig.json)
+    case 17: // Save WiFi (-> /netconfig.json)
       NetConfigStore::save(netConfig);
       _actionConfirmUntilMs = millis() + 600;
       break;
-    case 16: // Exit
+    case 18: // Exit
       _state = State::CLOSED;
       break;
     default:
@@ -187,12 +209,13 @@ String Menu::valueTextFor(uint8_t itemIndex) const {
     // Password itself is never shown, only whether one is set -- same
     // convention as the CLI's `net` command.
     case 7: return netConfig.password[0] ? String(F("set")) : String(F("not set"));
-    case 8: return String(getHubOctet(0));
-    case 9: return String(getHubOctet(1));
-    case 10: return String(getHubOctet(2));
-    case 11: return String(getHubOctet(3));
-    case 12: return String(netConfig.hubPort);
-    case 13: return netConfig.enabled ? String(F("ON")) : String(F("OFF"));
+    case 8: return wifiStateText();
+    case 9: return String(getHubOctet(0));
+    case 10: return String(getHubOctet(1));
+    case 11: return String(getHubOctet(2));
+    case 12: return String(getHubOctet(3));
+    case 13: return String(netConfig.hubPort);
+    case 14: return netConfig.enabled ? String(F("ON")) : String(F("OFF"));
     default: return String(); // ACTION items have no value column
   }
 }

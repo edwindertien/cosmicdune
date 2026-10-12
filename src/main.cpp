@@ -11,16 +11,19 @@
 #include "io/menu.h"
 
 // ---------------------------------------------------------------------------
-// cosmic dune -- sensor pod firmware, iteration 1e:
+// cosmic dune -- sensor pod firmware, iteration 1f:
 //   Grove ear-clip pulse (GP26) sets the travelling pulse's speed/tempo;
 //   GSR (GP27) sets its colour (white -> blue -> purple -> red). Both
 //   render on the 250-LED strip (GP17). Telemetry (bpm/ibi/signal/gsr)
 //   goes out over WiFi as OSC to a hub, once configured via the CLI's
-//   `net` commands. An SH1107 OLED (I2C0, GP8/GP9) shows a live
-//   beat-flash + BPM graph + WiFi status, and an M5Stack encoder (I2C1,
-//   GP6/GP7) drives an on-pod settings menu for GSR/strip settings --
-//   see io/menu.h for exactly what's covered there vs. CLI-only. The USB
-//   CLI keeps working unmodified alongside all of this.
+//   `net` commands -- WiFi gives up after a timeout rather than retrying
+//   forever if nothing's found (see net/osc_link.h), and a hardware
+//   watchdog reboots the pod if anything ever hangs longer than that. An
+//   SH1107 OLED (I2C0, GP8/GP9) shows a live beat-flash + pulse waveform +
+//   GSR graph + WiFi status, and an M5Stack encoder (I2C1, GP6/GP7)
+//   drives an on-pod settings menu for GSR/strip/WiFi settings -- see
+//   io/menu.h for exactly what's covered there vs. CLI-only. The USB CLI
+//   keeps working unmodified alongside all of this.
 // ---------------------------------------------------------------------------
 
 static void onBeat(uint16_t bpm, uint32_t ibiMs) {
@@ -33,6 +36,15 @@ void setup() {
   Serial.begin(115200);
   delay(50);
   Serial.println(F("=== cosmic dune sensor pod booting ==="));
+
+  // Armed early -- before anything else -- so it protects setup() itself
+  // too, not just loop(). Nothing here legitimately takes anywhere close
+  // to WATCHDOG_MS (the longest deliberate wait is GSR's ~0.5s baseline
+  // calibration below), so this can't fire spuriously; it exists purely
+  // as a backstop against a genuine hang anywhere (I2C, WiFi, or
+  // otherwise) leaving the pod silently frozen through a performance
+  // instead of recovering on its own.
+  rp2040.wdt_begin(Timing::WATCHDOG_MS);
 
   cli.begin();
 
@@ -98,8 +110,9 @@ void loop() {
   } else {
     pulseStrip.idle();
   }
-  oscLink.tick(); // (re)connects WiFi on its own timer; a cheap no-op
-                   // once connected, or always if `net` is unconfigured
+  oscLink.tick(); // advances the connect/give-up state machine (see
+                   // net/osc_link.h) -- a cheap no-op once CONNECTED or
+                   // GAVE_UP, or always if `net` is unconfigured
   oscLink.sendTelemetry(pulseSensor.bpm(), pulseSensor.lastIbiMs(),
                          pulseSensor.hasSignal(), gsrSensor.raw(),
                          gsrSensor.normalized()); // rate-limited internally;
@@ -119,4 +132,7 @@ void loop() {
   }
 
   cli.tick();
+
+  rp2040.wdt_reset(); // must be the last thing in loop() -- see setup()'s
+                        // comment for why this is armed at all
 }

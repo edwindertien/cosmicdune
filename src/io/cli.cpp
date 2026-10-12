@@ -77,6 +77,19 @@ static String remainderAfterTokens(const String& line, int skipTokens) {
   return line.substring(pos);
 }
 
+// ---------------------------------------------------------------------------
+// One-line description of OscLink's connection state -- shared by `status`
+// and the bare `net` command so both agree on the wording.
+// ---------------------------------------------------------------------------
+static String wifiStateText() {
+  switch (oscLink.state()) {
+    case NetLinkState::CONNECTED:  return String(F("connected"));
+    case NetLinkState::CONNECTING: return String(F("connecting"));
+    case NetLinkState::GAVE_UP:    return String(F("gave up (try 'net retry')"));
+    default:                        return String(F("off"));
+  }
+}
+
 void Cli::handleLine(const String& lineIn) {
   String line = lineIn;
   line.trim();
@@ -194,12 +207,11 @@ void Cli::handleLine(const String& lineIn) {
       Serial.print(F(" rate=")); Serial.print(netConfig.sendHz); Serial.print(F("Hz"));
       Serial.print(F(" enabled=")); Serial.print(netConfig.enabled ? "yes" : "no");
       Serial.print(F(" wifi="));
+      Serial.print(wifiStateText());
       if (oscLink.connected()) {
-        Serial.print(F("connected ("));
+        Serial.print(F(" ("));
         Serial.print(oscLink.localIp());
         Serial.print(')');
-      } else {
-        Serial.print(F("not connected"));
       }
       Serial.println();
       return;
@@ -253,13 +265,18 @@ void Cli::handleLine(const String& lineIn) {
       netConfig.enabled = false;
       Serial.println(F("OK net disabled"));
 
+    } else if (a == "retry") {
+      oscLink.retry();
+      Serial.println(F("OK retrying..."));
+
     } else if (a == "save") {
       bool ok = NetConfigStore::save(netConfig);
       Serial.println(ok ? F("OK saved to /netconfig.json") : F("ERR save failed"));
 
     } else {
       Serial.println(F("usage: net | net ssid <name> | net pass <pass> | net pod <1-6> |"));
-      Serial.println(F("       net hub <ip> <port> | net rate <1-60> | net enable|disable | net save"));
+      Serial.println(F("       net hub <ip> <port> | net rate <1-60> | net enable|disable |"));
+      Serial.println(F("       net retry | net save"));
     }
 
   } else if (cmd == "save") {
@@ -318,6 +335,10 @@ void Cli::printHelp() {
     "  net hub <ip> <port>    hub's IP (dotted quad, not a hostname) + UDP port\n"
     "  net rate <1-60>        telemetry rate in Hz (default 15)\n"
     "  net enable|disable     turn WiFi/OSC telemetry on or off\n"
+    "  net retry              force a fresh connect attempt now -- also what\n"
+    "                         to use after 'gave up' shows in `net`/`status`\n"
+    "                         (WiFi gives up after ~8s if nothing's found,\n"
+    "                         rather than retrying forever)\n"
     "  net save               persist current net settings to /netconfig.json\n"
     "                         (settings apply live immediately; save just\n"
     "                         makes them survive a reboot)\n"
@@ -341,5 +362,5 @@ void Cli::printStatus() {
   Serial.print(F(" (norm="));    Serial.print(gsrSensor.normalized(), 2);
   Serial.print(')');
   Serial.print(F(" net="));
-  Serial.println(oscLink.connected() ? F("connected") : (netConfig.enabled ? F("connecting") : F("off")));
+  Serial.println(wifiStateText());
 }

@@ -164,4 +164,21 @@ namespace Timing {
   // sample faster than this, and slower sampling means more effective
   // smoothing for the same IIR coefficient (see GsrSensor::tick()).
   static constexpr uint16_t GSR_SAMPLE_MS = 50; // ~20Hz
+
+  // WiFi connect give-up point (see net/osc_link.h) -- generous enough
+  // that a real, slow-but-working join isn't cut off early, short enough
+  // that "no matching AP in range" doesn't occupy the pod indefinitely.
+  static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 8000;
+
+  // Hardware watchdog period (main.cpp calls rp2040.wdt_begin() with this
+  // at boot, rp2040.wdt_reset() at the end of every loop()). Comfortably
+  // longer than WIFI_CONNECT_TIMEOUT_MS above -- this is the backstop for
+  // the case that app-level timeout can't catch: WiFi.begin()'s
+  // underlying CYW43 driver has real, currently-documented cases of
+  // hanging and never returning control at all (see context.md), in
+  // which case nothing in this codebase gets to run its own timeout
+  // logic. If loop() doesn't complete a full pass within this long, for
+  // any reason (not just WiFi), the whole board reboots rather than
+  // staying silently frozen through a performance.
+  static constexpr uint32_t WATCHDOG_MS = 15000;
 }
