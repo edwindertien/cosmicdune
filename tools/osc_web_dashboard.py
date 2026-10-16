@@ -24,15 +24,25 @@ for testing:
 Requires: pip install flask python-osc   (see requirements.txt)
 """
 import argparse
+import os
 import socket
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, abort, jsonify, render_template_string, send_file
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_server import ThreadingOSCUDPServer
+
+# Chart.js is served from a copy next to this script (chart.umd.js) rather
+# than from a CDN: a Pi running its own hotspot often has no internet, and
+# when the CDN can't be reached the page's chart setup used to throw, which
+# also stopped the status table from ever updating. The CDN is only the
+# fallback if that file is missing.
+HERE = os.path.dirname(os.path.abspath(__file__))
+CHART_JS_FILE = os.path.join(HERE, "chart.umd.js")
+CHART_JS_CDN = "https://cdn.jsdelivr.net/npm/chart.js@4"
 
 # A pod not heard from in this long is shown OFFLINE -- same reasoning and
 # rough magnitude as osc_test_hub.py's STALE_AFTER_S.
@@ -202,7 +212,7 @@ PAGE = """
 <head>
 <meta charset="utf-8">
 <title>cosmic dune -- OSC dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="{{ chart_src }}"></script>
 <style>
   body { font-family: -apple-system, Helvetica, Arial, sans-serif; background: #14161a; color: #e8e8e8; margin: 0; padding: 20px; }
   h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
@@ -222,6 +232,10 @@ PAGE = """
 </head>
 <body>
   <h1>cosmic dune -- OSC dashboard</h1>
+  <div id="chartWarning" class="banner" style="display:none; color:#e0a050">
+    Charts unavailable: Chart.js failed to load (no internet, and no chart.umd.js next to the script).
+    The status table below still updates.
+  </div>
   <div class="banner">
     Listening on UDP :{{ osc_port }} (all interfaces). On each pod's CLI, use the address on
     the pod's own network:
@@ -301,20 +315,27 @@ async function poll() {
         `<td>${p.gsr_raw}</td><td>${p.gsr_norm.toFixed(2)}</td>`;
       tbody.appendChild(tr);
 
-      const bpmDs = ensureDataset(bpmChart, id);
-      bpmDs.data = p.history.t.map((x, i) => ({x: x, y: p.history.bpm[i]}));
-
-      const gsrDs = ensureDataset(gsrChart, id);
-      gsrDs.data = p.history.t.map((x, i) => ({x: x, y: p.history.gsr[i]}));
+      if (bpmChart) {
+        const bpmDs = ensureDataset(bpmChart, id);
+        bpmDs.data = p.history.t.map((x, i) => ({x: x, y: p.history.bpm[i]}));
+      }
+      if (gsrChart) {
+        const gsrDs = ensureDataset(gsrChart, id);
+        gsrDs.data = p.history.t.map((x, i) => ({x: x, y: p.history.gsr[i]}));
+      }
     }
   }
-  bpmChart.update('none');
-  gsrChart.update('none');
+  if (bpmChart) bpmChart.update('none');
+  if (gsrChart) gsrChart.update('none');
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  bpmChart = makeChart('bpmChart', 'BPM', 30, 180);
-  gsrChart = makeChart('gsrChart', 'GSR (normalized)', 0, 1);
+  if (typeof Chart !== 'undefined') {
+    bpmChart = makeChart('bpmChart', 'BPM', 30, 180);
+    gsrChart = makeChart('gsrChart', 'GSR (normalized)', 0, 1);
+  } else {
+    document.getElementById('chartWarning').style.display = 'block';
+  }
   poll();
   setInterval(poll, 1000);
 });
@@ -340,11 +361,23 @@ def main() -> None:
     for name, ip in local_ips:
         print(f"    {name:<14} net hub {ip} {args.osc_port}    (dashboard: http://{ip}:{args.web_port}/)")
 
+    have_local_chart = os.path.exists(CHART_JS_FILE)
+    chart_src = "/chart.js" if have_local_chart else CHART_JS_CDN
+    if not have_local_chart:
+        print(f"\nNOTE: {CHART_JS_FILE} not found -- charts will load from a CDN and need internet.")
+
     app = Flask(__name__)
+
+    @app.route("/chart.js")
+    def chart_js():
+        if not have_local_chart:
+            abort(404)
+        return send_file(CHART_JS_FILE, mimetype="application/javascript")
 
     @app.route("/")
     def index():
-        return render_template_string(PAGE, osc_port=args.osc_port, local_ips=local_ips)
+        return render_template_string(PAGE, osc_port=args.osc_port, local_ips=local_ips,
+                                      chart_src=chart_src)
 
     @app.route("/api/data")
     def api_data():
