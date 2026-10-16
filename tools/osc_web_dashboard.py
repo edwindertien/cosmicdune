@@ -57,6 +57,35 @@ def get_local_ip() -> str:
         s.close()
 
 
+def get_local_ips() -> list:
+    """Every non-loopback IPv4 address on this machine, as (interface, ip).
+
+    get_local_ip() above only reports the interface the OS would use to
+    reach the internet. On a Pi serving its own hotspot that's usually the
+    wrong one (e.g. ethernet at 192.168.x.x, while the pods are on
+    wlan0 at 10.42.0.1), so the banner pointed pods at the wrong address.
+    The servers themselves bind 0.0.0.0, i.e. every interface, so they
+    work on all of these -- only what we PRINT was misleading. Uses
+    `ip -4 -o addr` (Linux); anywhere that's missing (macOS), falls back
+    to the single default-route guess.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show"],
+                             capture_output=True, text=True, timeout=2).stdout
+        found = []
+        for line in out.splitlines():
+            parts = line.split()          # "2: eth0  inet 192.168.1.5/24 ..."
+            ip = parts[3].split("/")[0]
+            if not ip.startswith("127."):
+                found.append((parts[1], ip))
+        if found:
+            return found
+    except (OSError, subprocess.SubprocessError, IndexError):
+        pass
+    return [("default route", get_local_ip())]
+
+
 @dataclass
 class Sample:
     t: float
@@ -194,8 +223,9 @@ PAGE = """
 <body>
   <h1>cosmic dune -- OSC dashboard</h1>
   <div class="banner">
-    Listening on UDP :{{ osc_port }} &nbsp;|&nbsp; this machine's IP: <code>{{ local_ip }}</code>
-    &nbsp;|&nbsp; on each pod's CLI: <code>net hub {{ local_ip }} {{ osc_port }}</code>
+    Listening on UDP :{{ osc_port }} (all interfaces). On each pod's CLI, use the address on
+    the pod's own network:
+    {% for name, ip in local_ips %}<code>net hub {{ ip }} {{ osc_port }}</code> ({{ name }}){% if not loop.last %}, {% endif %}{% endfor %}
   </div>
 
   <div class="charts">
@@ -303,18 +333,18 @@ def main() -> None:
     dashboard = Dashboard(args.osc_port)
     dashboard.run_osc_server()
 
-    local_ip = get_local_ip()
+    local_ips = get_local_ips()
     print("cosmic dune -- OSC web dashboard")
-    print(f"Listening for pod telemetry on UDP :{args.osc_port}")
-    print(f"This machine's IP: {local_ip}")
-    print(f"On each pod's CLI, run:\n    net hub {local_ip} {args.osc_port}\n    net save")
-    print(f"\nOpen http://{local_ip}:{args.web_port}/  (or http://localhost:{args.web_port}/ on this machine)")
+    print(f"Listening for pod telemetry on UDP :{args.osc_port} (all interfaces)")
+    print("This machine's addresses -- on each pod's CLI use the one on the pod's own network, then `net save`:")
+    for name, ip in local_ips:
+        print(f"    {name:<14} net hub {ip} {args.osc_port}    (dashboard: http://{ip}:{args.web_port}/)")
 
     app = Flask(__name__)
 
     @app.route("/")
     def index():
-        return render_template_string(PAGE, osc_port=args.osc_port, local_ip=local_ip)
+        return render_template_string(PAGE, osc_port=args.osc_port, local_ips=local_ips)
 
     @app.route("/api/data")
     def api_data():

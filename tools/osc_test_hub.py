@@ -60,6 +60,35 @@ def get_local_ip() -> str:
     finally:
         s.close()
 
+
+def get_local_ips() -> list:
+    """Every non-loopback IPv4 address on this machine, as (interface, ip).
+
+    get_local_ip() above only reports the interface the OS would use to
+    reach the internet. On a Pi serving its own hotspot that's usually the
+    wrong one (e.g. ethernet at 192.168.x.x, while the pods are on
+    wlan0 at 10.42.0.1), so the banner pointed pods at the wrong address.
+    The servers themselves bind 0.0.0.0, i.e. every interface, so they
+    work on all of these -- only what we PRINT was misleading. Uses
+    `ip -4 -o addr` (Linux); anywhere that's missing (macOS), falls back
+    to the single default-route guess.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show"],
+                             capture_output=True, text=True, timeout=2).stdout
+        found = []
+        for line in out.splitlines():
+            parts = line.split()          # "2: eth0  inet 192.168.1.5/24 ..."
+            ip = parts[3].split("/")[0]
+            if not ip.startswith("127."):
+                found.append((parts[1], ip))
+        if found:
+            return found
+    except (OSError, subprocess.SubprocessError, IndexError):
+        pass
+    return [("default route", get_local_ip())]
+
 # A pod not heard from in this long is shown OFFLINE rather than just
 # displaying its last-known (increasingly stale) values -- roughly the
 # same order of magnitude as the firmware's own
@@ -87,7 +116,7 @@ class Monitor:
 
     def __init__(self, port: int):
         self.port = port
-        self.local_ip = get_local_ip()  # cached once -- doesn't need
+        self.local_ips = get_local_ips()  # cached once -- doesn't need
                                           # recomputing every render() cycle,
                                           # and IP shouldn't change mid-session
         self.pods: dict[int, PodState] = {}
@@ -136,7 +165,8 @@ class Monitor:
         # drop these two escapes and let it scroll instead.
         sys.stdout.write("\x1b[2J\x1b[H")
         print(f"cosmic dune -- OSC test hub, listening on UDP :{self.port}")
-        print(f"This machine's IP: {self.local_ip}  ->  on each pod: net hub {self.local_ip} {self.port}")
+        for name, ip in self.local_ips:
+            print(f"  {name:<14} -> on a pod on this network: net hub {ip} {self.port}")
         print(f"{'pod':>4} {'age':>6} {'status':>8} {'bpm':>5} {'ibi(ms)':>8} "
               f"{'signal':>7} {'gsr raw':>8} {'gsr norm':>9}")
         if not rows:
