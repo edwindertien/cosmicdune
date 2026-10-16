@@ -1,0 +1,13 @@
+# /etc/systemd/system/cosmic-dune-hotspot.service
+[Unit]
+Description=cosmic dune WiFi hotspot
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nmcli connection up Hotspot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
