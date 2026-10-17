@@ -1,8 +1,10 @@
 # cosmic dune -- sensor pod: design history & handover
 
-This is the "why", not the "how" -- `README.md` covers wiring/build/CLI.
-Written for whoever (including future Edwin) needs to pick this back up
-without re-deriving every decision from scratch.
+This is the "why", not the "how" -- `README.md` covers wiring, build, CLI, the
+Pi setup and the laser tools. Written for whoever (including future Edwin)
+needs to pick this back up without re-deriving every decision from scratch.
+Despite the title it now covers the whole system: the pod firmware, the Pi
+(hotspot + dashboard) and the laser tools.
 
 ## The project, one level up
 
@@ -12,8 +14,10 @@ The signal is triggered by 6 musicians' biosignals synchronizing on stage.
 Each musician wears a **pod** (this repo): a Raspberry Pi Pico W reading
 their heart rate and skin conductance, driving a 250-LED strip and an
 on-pod OLED display live, and reporting telemetry to a central **hub**
-(not built yet) that watches all 6 pods for synchronization and drives
-the actual Laserworld CUBE 3.
+that watches all 6 pods for synchronization and drives the actual
+Laserworld CUBE 3. The hub is not one program yet: a Raspberry Pi hosts the
+pods' WiFi and a dashboard, and separate tools drive the laser (below). **A
+standing constraint: everything must work with no internet at the venue.**
 
 ## Hardware decisions
 
@@ -54,7 +58,16 @@ namespace is the single source of truth if the two ever disagree.
   settings), each persisted to LittleFS as their own JSON file.
 - `src/net/` -- osc_link (WiFi + OSC telemetry sender).
 - `src/io/` -- cli (USB CDC serial) and menu (on-pod OLED+encoder settings UI).
-- `src/main.cpp` -- wires it all together; boot order matters (see below).
+- `src/main.cpp` -- wires it all together; boot order matters (see below). It
+  also arms a 15 s hardware watchdog first thing in `setup()` and feeds it at
+  the end of every `loop()`.
+- `src/net/osc_link` is a small state machine (IDLE / CONNECTING / CONNECTED /
+  GAVE_UP), and the menu has 19 items -- see "WiFi" below.
+- `tools/` -- `osc_web_dashboard.py` (Flask, receives OSC, serves the touch-screen
+  page), `osc_test_hub.py` (terminal monitor + fake pods), `chart.umd.js`.
+- `tools/laser/` -- `helios_dac.py` (fail-dark ctypes driver), `patterns.py`
+  (test patterns + frame renderer + safety validator + PNG previewer),
+  `visuals.py` (pod-driven scenes, sync), `laser_test.py` (the CLI).
 
 ## Decisions and why
 
@@ -311,33 +324,275 @@ Four rounds of build-tooling trouble, four different actual causes:
   confirmed end-to-end with a live send/receive test rather than just
   read from docs.
 
+### WiFi: non-blocking connect, give-up, watchdog
+
+**Symptom:** about 3 s after boot the pod froze -- LED strip and heart-rate
+dead -- and stayed frozen when no WiFi could be found.
+
+**First attempt, wrong.** A state machine with an 8 s give-up timer around
+`WiFi.begin()`. It could never help: on this core `WiFi.begin()` blocks *inside
+the call* until the join succeeds or fails, and the timer only runs after the
+call returns. (The header comment claimed "non-blocking"; it wasn't. A timeout
+cannot guard a blocking call from the same thread.)
+
+**Evidence it can be worse than slow.** The CYW43 join has documented hangs
+(pico-sdk issue 2186: a hang while connecting in station mode), and other
+projects report that the blocking join can wait forever (Meshtastic's RP2040
+WiFi fix runs it in a separate task for that reason). So "wait it out" is not
+an option.
+
+**What it does now.**
+- `WiFi.beginNoBlock()` returns immediately; `OscLink::tick()` polls
+  `WiFi.status()` while the rest of `loop()` keeps running. (Rob Miles' write-up
+  of `beginNoBlock` as a background connection on the Pico W is what surfaced it.)
+- After `Timing::WIFI_CONNECT_TIMEOUT_MS` (8 s) it calls `WiFi.disconnect()`
+  (so the driver stops retrying in the background -- otherwise "gave up" would
+  be mere bookkeeping) and enters GAVE_UP. It does **not** retry on its own:
+  `net retry`, the menu's Net Retry, or toggling enable/disable restarts it.
+  Rationale: a network that isn't there should not occupy the pod forever, and
+  a person is back in the loop.
+- An empty password is passed as `nullptr` (an open network), not as an empty
+  WPA passphrase. (The test hotspot is open.)
+- The menu gained **WiFi Status** (view) and **Net Retry**; `status`/`net` print
+  off / connecting / connected / gave up.
+- **Watchdog backstop:** `rp2040.wdt_begin(15000)` early in `setup()`,
+  `rp2040.wdt_reset()` last in `loop()` and around the WiFi calls. If anything
+  stalls the pod 15 s -- WiFi or not -- it reboots instead of freezing through a
+  performance. Cost: a reboot loses the GSR baseline. Risk: if something still
+  blocks >= 15 s, the pod reboots forever (signature: the boot banner every ~15 s).
+  A guard that skips auto-connect after a watchdog reset was considered and not
+  built, because `rp2040.reboot()` also goes through the watchdog.
+
+**Rejected:** running WiFi on the RP2040's second core so a hang there can't
+touch the first. A comment on an arduino-pico pull request reports WiFi used from both
+cores is unstable, and this firmware also does I2C and FastLED.
+
+**Status:** joining the Pi's hotspot and sending OSC works *(confirmed)*. The
+behaviour with no network in range -- LEDs and heart-rate keep going, give-up
+after 8 s, `net retry` recovers, no reboot loop -- is *(untested)*.
+
+### The Pi hosts the network; the hotspot saga
+
+**Why a Pi access point:** venue WiFi is an unknown (client isolation, captive
+portals, no coverage on the day). A network the Pi creates is always there once
+the Pi is on, and it removes the "no network found" case from the show.
+
+**How:** current Raspberry Pi OS (Bookworm/Trixie) runs NetworkManager, which
+has hotspot built in (`nmcli`); no `hostapd`/`dnsmasq` by hand. The
+`ipv4.method shared` profile gives DHCP to the pods; by default the Pi is
+`10.42.0.1`.
+
+**The flapping.** The first attempts -- a manual profile plus a systemd unit
+(`nmcli connection up Hotspot`) plus autoconnect -- gave a hotspot that
+appeared, vanished, let the Pi rejoin the home WiFi, and came back, repeatedly.
+The Pi has **one radio**: it is an AP *or* a client, never both, and
+NetworkManager picks among saved profiles by priority. Likely contributors:
+two activation mechanisms (autoconnect and the boot unit), possibly duplicate
+profiles of the same name (the unit's by-name `up` is ambiguous then), and the
+home profile still set to autoconnect. The recommended recipe (README): one
+profile, priority 100, `autoconnect-retries 0` (the default of 4 can hand the
+radio back to the home network after a few failures), other WiFi profiles
+autoconnect-off, no boot unit. A hotspot was later created and a pod joined it
+(10.42.0.38); **the actual root cause was never pinned down**, and stability
+across reboots is unconfirmed. Next time it flaps: read the `reason '...'` in
+`journalctl -u NetworkManager -f`.
+
+**Security note:** the current test hotspot (`distress`) is open (`pass=(unset)`).
+
+### Offline-first, and the dashboard
+
+**The bug that taught the rule.** The first dashboard loaded Chart.js from a CDN.
+On the hotspot the Pi had no internet, so the page's setup threw before it ever
+started polling -- the page sat on "no pods heard yet" while the server was
+receiving data fine (confirmed by `curl /api/data` and by running the page's
+JavaScript in Node with Chart.js absent). Fix: `chart.umd.js` (Chart.js 4.5.1,
+MIT, from npm) is served by the dashboard itself; the CDN fallback was removed
+on purpose (it would only ever fail slowly); the page also no longer depends on
+Chart.js to start -- tiles and numbers keep working and the graph area says what
+is missing. The page contains no external URL (checked by logging every request
+in a headless browser).
+
+**The 800x480 redesign.** Six always-present tiles (pod slots), tap for detail,
+because 12 small graphs don't fit and a status screen wants values at a glance.
+Decisions worth knowing:
+- A tile's GSR meter uses the same four-stop palette as the LED strip, so the
+  screen shows what the musician's strip is showing.
+- States: online (green), `no pulse` (amber: pod online, `signal` = 0), `OFFLINE`
+  (nothing for 3 s), never heard (greyed, not tappable).
+- The grid polls a small `/api/summary`; only the detail view fetches
+  `/api/pod/<id>` with history. Less data per second on a Pi 3 (and over the
+  hotspot) than shipping every pod's history every second.
+- History is one point per pod per 250 ms for 60 s. BPM and GSR messages arrive ~30
+  times a second (15 Hz x 2), and storing every one gave only ~13 s of history. A point is recorded only after
+  both a BPM and a GSR value have arrived (otherwise the first point plotted
+  the missing one as 0).
+- It is a plain script, not `flask run`: the OSC listener starts in the script.
+- Verification method: a headless Chromium (`@sparticuz/chromium` +
+  `puppeteer-core`, installed in a scratch directory, not part of the repo)
+  drove the page at exactly 800x480 with simulated pods: screenshots, taps,
+  overflow check, console errors, the Chart.js-blocked case. **What that cannot
+  tell:** touch ergonomics, kiosk mode, and performance on the real Pi.
+- Also fixed on the way: the banner printed one IP (the interface the OS uses to
+  reach the internet -- the Ethernet, not the hotspot); it now lists every
+  interface's address with the `net hub` command for each.
+
+### Laser: bring-up on its own, and a driver that fails dark
+
+**Order:** the laser is the one place a software mistake can hurt someone, so
+it was brought up separately from the sensors, with test patterns first.
+
+**Helios SDK facts** (read from the SDK source, `github.com/Grix/helios_dac`,
+MIT): USB frames are at most 4095 points; 20-40 ms per frame is recommended
+(10 ms is the absolute minimum); `OpenDevicesOnlyUsb` skips the network (IDN)
+scan; the macOS dylib in the repo is universal and finds its libusb next to
+itself (`@rpath` + `@loader_path`); the Linux `.so` in the repo is x86-64 only.
+
+**Fail dark.** The SDK's Python example writes frames with flags = 0, which
+makes the DAC **loop the last frame forever** if the host program stops. The
+driver always uses `SINGLE_MODE` (the SDK's own default): play once, and turn the
+laser off if no new frame arrives. The price: a Python stall longer than a frame
+(~30 ms) shows as a brief flicker (the status line counts "late" frames). The
+hub may later want frame generation in its own thread.
+
+**The official Pi build line is wrong for modern distros.** It lists
+`-lusb-1.0` before the object files; with `--as-needed` (the Debian/Ubuntu/
+Raspberry Pi OS default) the linker drops it and the `.so` fails to load
+(`undefined symbol: libusb_open`). Found by building the real library and
+loading it; the fix is to put `-lusb-1.0 -lpthread` after the `.o` files.
+
+**Frame renderer** (`patterns.py`). Strokes are sampled at a density chosen to
+land on a ~30 ms frame (bounded between 0.002 and 0.02 of the field per point),
+with blanked moves between strokes, settle points where the beam turns on/off,
+and corner dwell at sharp corners. Frames shorter than ~15 ms repeat the shape
+up to ~20 ms (robust against host hiccups); repeating only when >25% short, so a
+19.9 ms shape isn't doubled to 40 ms. Every frame starts and ends with the beam
+off at the centre, so a frame stream that stops always rests on a blanked point.
+**Validator:** refuses a frame with a static dot (lit extent < 0.04 on the +-1
+field, or more than 8 lit points on one spot), a colour above the intensity cap,
+a non-finite or out-of-field coordinate, a lit first/last point, or a bad point
+count. It is a seatbelt against bugs in future pattern code, not a feature.
+
+**First bench results** *(from the real laser)*: orientation correct; `circle`,
+`orient`, `colors` correct; linearity good; start/stop of lines needs
+calibrating; `sweep` showed red, blue, white but no green and a long pause;
+`rays` moved the mirrors (audible) but showed no light.
+- No green in `sweep` is by design: the palette is the pod's LED palette (white,
+  blue, purple, red). `--palette spectrum` adds green.
+- Pause / no light: **hypothesis** -- diode thresholds. At intensity 0.15 mixed
+  colours drive some channels very low (purple is about 24/255 red, 4/255 green,
+  33/255 blue) and a laser diode emits nothing below its threshold, per channel.
+  Not confirmed. Hence `run ramp` (measure each channel's threshold) and
+  `--rgb-min` / `--rgb-gain` (drive = intensity * gain * (min + (1-min)*c), 0 for
+  c = 0, so the cap still bounds every channel).
+- Line starts/stops: the galvos lag the beam, so `--blank-shift N` delays the
+  colour N points; `--settle`, `--dwell`, `--travel-step` expose the settling
+  and blanked-jump behaviour (the audible noise in `rays` may be blanked jumps
+  that are too fast). **All of this is the second iteration and has not been
+  run on the real laser.**
+
+**Verification method:** a mock Helios shared library (same exported functions,
+logs every call and dumps every frame) plus ~70 scripted checks, run in the
+working session and **not part of the repo**: startup order (Stop before any
+frame), flags = 2 on every frame, every shutdown path (Ctrl-C, SIGTERM,
+SIGHUP, no DAC, refused arm) leaving Stop + shutter closed + close, interactive
+keys through a pseudo-terminal, terminal restore, parameter limits refused before
+the DAC is opened, live OSC input with simulated pods. Plus a real SDK build with
+no DAC attached (symbol binding, error path) and rendered previews. **Not
+tested:** actual USB traffic, the CUBE's ILDA behaviour, the Pi.
+
+### Visuals: six pods into one pulse (`visuals.py`)
+
+**The idea.** Each pod has a heartbeat oscillator at its own BPM. What is drawn
+uses a *display* phase pulled toward the shared group phase by `sync`: sync 0 =
+six independent pulses, sync 1 = one pulse. A beat is a quick swell and slow
+relaxation, so a ring goes small -> big -> small. Scenes: `merge` (six rings
+drift together and fuse), `bloom` (one ring in six sectors, raised-cosine
+blended, colour blended too), `ripple` (concentric), `spokes` (rays). The preview
+sheet (`preview scenes`) shows all of them at five sync values.
+
+**Safety of the "dot".** Rings never shrink below `min_r` (0.14, raised for small
+`--size` so the validator still passes), and small rings are dimmed (45% at the
+smallest) so energy per unit length stays about constant. Near-identical rings
+are drawn once (`merge_circles`): saves the point budget and stops merging pods
+piling six beams on one line. With nobody online a dim idle ring breathes at 72.
+
+**Where sync comes from.** `SyncMeter`: 1 - (mean absolute BPM deviation /
+tolerance, default 10 BPM), low-passed over ~1.5 s. `effective_sync` adds a
+manual *assist* knob: 0 = only what the pods do, 1 = fully merged. `--sync`
+fixes it. **This is rate sync.** The pods send a smoothed BPM, not beat events, so
+the visuals' pulse is our oscillator at their rate, not their actual heartbeat.
+For real beat-phase sync the firmware would send a message per detected beat
+(see Open questions).
+
+**Limits found while testing:** at 20 kpps six large rings reach ~33 ms per frame
+(`ripple`/`merge` at mid sync), i.e. ~30 fps; below that it is fine. Rendering
+took 1-6 ms per frame on the small Linux VM used for testing (a one-off 28 ms spike
+was seen, probably garbage collection); a Mac and the Pi 3 are untested.
+
+**Inputs:** `DemoInputs` (scatter -> converge -> scatter, 90 s cycle) or
+`OscInputs` (`--osc-port`, python-osc, the same `/pod/<id>/...` messages). Live
+keys: `] [` sync assist, `0 1` knob min/max, `n p` scene, `b`/SPACE blackout, `q`.
+
+### Lessons that cost time here
+
+- A timeout around a blocking call can't fire until the call returns -- find the
+  non-blocking call (`beginNoBlock`) instead of wrapping the blocking one.
+- Anything fetched from the internet at run time is a bug on a hotspot with no
+  internet (the CDN, and the dashboard's first IP banner assumed a default route).
+- Vendor docs can be wrong for current systems (Helios link order). Build the real
+  thing and load it, even without the hardware attached.
+- State what was tested, and how: the mock, the headless browser and the previews
+  each prove something specific and nothing more.
+
 ## Current state (as of this writing)
 
-Confirmed working on real hardware: pulse sensing, GSR sensing + colour
-mapping, both pulse timing modes, WiFi connect + OSC telemetry to a real
-hub-side listener, LittleFS persistence for both config files, the
-SH1107 display (monitor view + menu), the M5Stack encoder (navigation,
-short/long press), the full build (all libraries resolving, `chain` +
-`lib_ignore` combination). `osc_test_hub.py` (terminal monitor +
-simulate) and `osc_web_dashboard.py` (Flask graphical dashboard) both
-verified end-to-end against real pod traffic.
+**Confirmed on real hardware:** pulse sensing, GSR sensing + colour mapping,
+both pulse timing modes, LittleFS persistence for both config files, the
+SH1107 display (monitor view + menu), the M5Stack encoder, the full build
+(`chain` + `lib_ignore`); the pod joining the Pi's hotspot (got 10.42.0.38) and
+OSC data reaching the dashboard on the Pi; the first round of laser test
+patterns (orientation, circle, orient, colors, linearity -- see "Laser").
 
-Not yet built: the actual hub (OSC-receiving + DMX/ILDA control of the
-Laserworld CUBE 3), USB MIDI reinstatement, the wired Ethernet fallback,
-any workflow for keeping 6 physical pods' `net pod` ids straight, menu
-submenu grouping (if the current flat 17-item list turns out to need it).
+**Written but untested (do not assume they work):**
+- Pod: WiFi non-blocking connect / give-up / `net retry` / watchdog with *no*
+  network in range; the 19-item menu (WiFi Status, Net Retry).
+- Pi: the 800x480 tile + detail dashboard on the real touch screen; the
+  hotspot's stability across reboots.
+- Laser: calibration flags, `ramp`, `show` and all four scenes, OSC input, the
+  Pi-side Helios build. Previewed and mock-tested only.
+
+**Not built:** the hub as one program (OSC -> sync -> visuals -> laser, with a
+sync slider on the dashboard), beat events from the pods, Pi boot automation,
+USB MIDI reinstatement, the wired Ethernet fallback, any workflow for keeping 6
+physical pods' `net pod` ids straight, menu submenu grouping.
 
 ## Open questions for next time
 
+- **Why `sweep` paused and `rays` showed nothing:** thresholds (run `ramp`)? Or
+  something else -- blanked jumps too fast, size too small? Needs the laser.
+- **Beat events.** Add `/pod/<id>/beat` to the firmware so the hub can measure
+  real beat-phase coherence and the laser can fire on actual heartbeats? It
+  changes what "sync" means for the piece (rate vs. phase), which is an artistic
+  as much as a technical decision. Telemetry is 15 Hz over WiFi, so beat timing
+  would be good to tens of milliseconds, not better.
+- **The hub:** one process owning the OSC port, feeding both the dashboard and the
+  laser; a sync slider on the touch screen. The dashboard and the laser tool
+  currently each want the UDP port the pods send to.
+- Is the hotspot stable across reboots, and should it get a WPA2 password before
+  the show?
+- The CUBE's safe `--pps` and scan size in ILDA mode; whether a Pi 3 renders and
+  feeds `show` without late frames.
 - Default `PulseMode` for actual performance use -- `ibi` (current
   default) or `fixed`? Needs eyes-on with real musicians, not a desk
   decision.
 - Encoder rotation direction (`readSteps()` positive = clockwise) --
   carried over as an assumption from the reference project, not
   independently reconfirmed on this exact unit.
-- Whether the 17-item flat menu needs grouping into submenus once used
+- Whether the 19-item flat menu needs grouping into submenus once used
   hands-on for real adjustments, or whether that's over-engineering a
   problem that doesn't actually bite in practice.
-- Laser control path: DMX (preset patterns, coarse) vs ILDA (via an
-  external DAC, full custom vector control) for the CUBE 3 -- see the
-  laser-control discussion for where this landed.
+- Should the mock Helios library and its test scripts join the repo, so the
+  driver's fail-dark behaviour can be re-checked after any change?
+
+*Resolved since the last version:* DMX vs ILDA for the CUBE 3 -- ILDA via the
+Helios USB DAC, in bring-up (see "Laser").
