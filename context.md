@@ -505,8 +505,10 @@ tested:** actual USB traffic, the CUBE's ILDA behaviour, the Pi.
 **The idea.** Each pod has a heartbeat oscillator at its own BPM. What is drawn
 uses a *display* phase pulled toward the shared group phase by `sync`: sync 0 =
 six independent pulses, sync 1 = one pulse. A beat is a quick swell and slow
-relaxation, so a ring goes small -> big -> small. Scenes: `merge` (six rings
-drift together and fuse), `bloom` (one ring in six sectors, raised-cosine
+relaxation, so a ring goes small -> big -> small. Scenes: `converge` (six small
+rings slide to the centre and fuse into one spot whose pulse grows -- the look
+asked for after the first round), `merge` (the same drift, but the fused ring
+ends big), `bloom` (one ring in six sectors, raised-cosine
 blended, colour blended too), `ripple` (concentric), `spokes` (rays). The preview
 sheet (`preview scenes`) shows all of them at five sync values.
 
@@ -529,9 +531,134 @@ For real beat-phase sync the firmware would send a message per detected beat
 took 1-6 ms per frame on the small Linux VM used for testing (a one-off 28 ms spike
 was seen, probably garbage collection); a Mac and the Pi 3 are untested.
 
-**Inputs:** `DemoInputs` (scatter -> converge -> scatter, 90 s cycle) or
-`OscInputs` (`--osc-port`, python-osc, the same `/pod/<id>/...` messages). Live
-keys: `] [` sync assist, `0 1` knob min/max, `n p` scene, `b`/SPACE blackout, `q`.
+**Inputs:** `DemoInputs` (scatter -> converge -> scatter, 90 s cycle), `OscInputs`
+(`--osc-port`, python-osc, the same `/pod/<id>/...` messages) or `DashboardInputs`
+(`--dashboard`: a background thread polls the running dashboard's `/api/summary`
+at 10 Hz, standard library only). The dashboard route exists because the pods have
+one hub address and a UDP port takes one listener: the dashboard stays the only
+OSC receiver and the laser tool reads from it, so both run on the Pi together. If
+the dashboard stops answering for 2 s the pods read as offline (an idle ring) and
+the status line says DASHBOARD UNREACHABLE. `FilledInputs` (`--fill-demo`) puts
+simulated pods in the empty slots so one real pod (`net pod N` -> slot N) can be
+tried among six. Live keys: `] [` sync assist, `0 1` knob min/max, `n p` scene,
+`b`/SPACE blackout, `q`.
+
+### The hub: the laser engine lives inside the dashboard
+
+**Why.** The request was a browser visualiser "in sync with the patterns sent to the ILDA
+interface", plus pattern buttons and sliders usable with no pod connected. A visualiser that
+re-draws what a pattern is *meant* to look like drifts from what the DAC gets (and ignores
+calibration). The only way to be exactly in sync is for one process to build each frame once and
+both hand it to the DAC and publish it to the browser. So `osc_web_dashboard.py` became the hub and
+`laser/engine.py` runs inside it. The earlier `laser_test.py show --dashboard` route (a second
+process polling `/api/summary`) was a stepping stone and still works against a hub in preview.
+
+**Engine** (`engine.py`). One thread loops: pods (live / fill / demo) -> scene or pattern ->
+`render` -> `validate` -> publish -> (if armed) `dac.write`. The browser gets the very same
+(x12, y12, r8, g8, b8) points, after orientation, `--rgb-min` and blank shift, as an 8-byte header
+plus 8 bytes per point (about 5 KB a frame), long-polled so a frame arrives when it is produced.
+The page draws them with a fade (persistence of vision) and additive blending.
+
+**One thread owns the DAC.** The Helios library is not documented as thread-safe, so web handlers
+only set flags under a lock and the engine thread makes every call (write, stop, close). A blackout
+is a flag, acted on within one frame (~30 ms) with a `Stop`; SINGLE_MODE means the laser is already
+going dark as frames stop.
+
+**Safety model, because a web page now controls a laser.**
+- No `--laser`: PREVIEW, no DAC opened -- also the "dummy mode" for testing patterns with no pod
+  and no laser. DEMO pods feed the scenes; test patterns need no pods.
+- `--laser`: starts SAFE (dark); frames reach the DAC only while ARMED; ARM is two taps on the
+  screen (the first expires after 3 s); BLACKOUT is immediate.
+- Limits are enforced **on the server** (`--max-intensity` default 0.3, `--max-size` default 0.6,
+  minimum size 0.10 because below ~0.08 a scene's smallest ring is under the validator's
+  static-dot limit and every frame would be refused): a client asking for intensity 99 gets the
+  limit (checked on the wire in the mock DAC test).
+- **Who may control.** The hotspot is open, so anyone on it can load the page. In preview anyone may
+  drive the drawing; with `--laser` only loopback addresses (the Pi's own screen) may, others get a
+  view-only visualiser. `--allow-remote-control` overrides. Writes also need an `X-Cosmic: 1` header
+  so a cross-site form post cannot trigger them. There is no real authentication.
+- Auto-disarm after `--auto-disarm` minutes (default 20) without control activity -- a deliberate
+  fail-safe that will surprise someone mid-show; `0` disables.
+- A DAC error disarms and latches; the engine keeps previewing; the hub must be restarted.
+- Only one program can hold the USB DAC (hub with `--laser` vs `laser_test.py`).
+
+**Bugs the browser tests found (all fixed)** -- the reason the page is tested in a real browser:
+- *ARM could overtake BLACKOUT.* The page fired control requests in parallel and the server
+  handles them on parallel threads. With ARM delayed in transit and BLACKOUT pressed right behind
+  it, the old page ended **armed with frames still flowing** (reproduced deterministically by
+  delaying requests in the browser; the same test must fail on the old code, and does). Control
+  requests are now serialised in the page: one in flight, in order; slider values coalesce; a queued
+  BLACKOUT cancels an unsent ARM and the reverse.
+- *A slider drag could lose its final value.* The page relied on the `change` event for the last
+  value and throttled `input` on the leading edge; when a drag ended where it began, the browser
+  fired no `change`, so the server kept a stale intermediate value and the next poll snapped the
+  slider back. Now a trailing-edge throttle (<= 100 ms) plus a send on release.
+- *`wait_frame` ignored its timeout* whenever any frame was published (it woke on a frame that was
+  not newer than requested). Now a deadline loop.
+- *A hub restart froze the picture of an open tab* (found from a user report: pod tiles kept updating
+  but the visualiser was blank until a refresh). The page asks for "a frame newer than the last I drew";
+  a restarted engine counts from 1 again, so with the tab's cursor at, say, 509 the server answered
+  "nothing newer" until the new counter passed 509 -- minutes to hours -- while the stateless pod
+  tiles looked fine. Reproduced in a real browser (startup orders A/B/D worked; only "hub restarted,
+  tab not refreshed" froze), fixed on the server: a cursor ahead of the engine's counter is treated as
+  stale and answered at once. A first fix also reset the cursor in the page whenever a state poll
+  looked "behind"; that misfired (a state response can be a few frames older than the frame already
+  drawn) and was **removed** -- the server-side fix alone is sufficient. Two older tests had asserted
+  the buggy behaviour (a far-ahead cursor must time out) and were corrected. A restart also resets the
+  engine to its defaults (source DEMO), which can look like "my pods stopped driving the picture".
+- *Rejected hypothesis:* thread-per-datagram OSC handling starving the engine. Measured: engine ~35
+  frames/s with no simulator, with six pods at 450 msg/s and at 1800 msg/s (hub CPU 22% -> 26% -> 40%).
+- *The AUTO/HOLD toggle was 17 px tall* -- too small to hit on a touch screen; now 24 px (the test
+  asserts a 24 px minimum on every touch target).
+- A hypothesis that state polling resets slider `min`/`max` and aborts drags was tested and **not**
+  supported (finger-speed drags were fine); it was not "fixed".
+
+**How in sync** (headless Chromium + simulated pods on a loaded VM): drawn frame vs engine frame --
+median lag 0 frames, 90th percentile 2-3 frames (60-90 ms), occasional spikes of 4-6. A frame is
+~30 ms. The DAC adds about one frame of its own. Pi 3: untested.
+
+**Layout (800x480).** Left: the square visualiser (396 px). Right: two tabs, PODS (2x3 compact
+tiles; the same six also as header pills) and LASER (source LIVE/FILL/DEMO, 15 scene/pattern
+buttons, SYNC/SIZE/LEVEL sliders, ARM/BLACKOUT) -- the LASER column is exactly full (396 px), so any
+added control needs something removed. The full-screen pod detail (graphs) is unchanged.
+
+**Verification method:** engine tests (24), HTTP tests with Flask's test client (20: permission
+rule for preview vs laser, remote refusal, binary endpoint, long-poll timeout, no-`laser/` folder
+fallback), and a headless Chromium suite at 800x480 (29: geometry, real clicks and drags, ARM/
+BLACKOUT against a mock DAC, view-only client, lag percentiles) plus targeted probes (drag
+consistency, forced request reordering). **Not tested:** the real DAC, the real laser, the Pi 3,
+the real touch screen.
+
+### The pod simulator (`pod_simulator.py`)
+
+**Why, and the IP question.** To exercise the hub's LIVE path and the sync logic without six pods
+(and to steer the BPMs by hand), a second Flask tool sends real UDP/OSC for six pods. Asked whether
+that needs IP spoofing: **no** -- `Dashboard.on_message` takes the pod id from the OSC address
+(`/pod/<id>/...`) and only stores the source IP for display; nothing keys on it. One process sends
+all six from one address (checked end to end: six tiles, one IP). `--distinct-ips` binds pod N to
+`127.0.0.<N+1>` so each tile shows its own address; it is cosmetic, loopback-only, works on Linux and
+needs `ifconfig lo0 alias` on macOS (untested there; it falls back to one address with a note).
+Forging source addresses (raw sockets, root, scapy) was neither needed nor built.
+
+**Fidelity.** The five messages per pod per tick, their order and types are read from
+`osc_link.cpp` and compared with the simulator's datagrams decoded by an independent OSC parser.
+A pod with no pulse keeps sending its BPM with `signal 0`, like the firmware. BPM glides linearly
+(CONVERGE/SCATTER over a chosen time) so the hub sees a plausible convergence, not a jump; WANDER is
+a mean-reverting drift (~2 BPM, ~0.08 GSR).
+
+**Design choices.** The UI binds 127.0.0.1 by default (it can inject fake pods into a hub) and writes
+accept JSON only (a cross-site form post is refused). Control requests are queued one at a time with a
+trailing-edge slider send, the same pattern as the hub's page. A bad target host is an error in the
+status line, never a crash or a silent no-op. Real pods share the ids 1-6, so a simulated pod must be
+switched OFF while its real counterpart is connected (`--off`).
+
+**Verification:** 24 checks (wire format vs the firmware source, pause, bad host, glide, presets,
+clamping, HTTP API), 11 end-to-end checks against the real hub (hub BPMs and GSR equal the simulator's;
+LIVE source: measured sync 0.0 scattered -> 0.99 converged -> 0.01 scattered; pod OFF -> OFFLINE after
+3 s; NO PULSE -> not counted live; distinct IPs), and 20 headless-browser checks at 800x480 (layout,
+24 px touch targets, every control, bad-target error, 12 fast drags). The browser pass found two
+layout flaws (clipped status text, wrapping "POD n") and one test-harness mistake. **Not tested:**
+simulator and real pods side by side, macOS loopback aliases, a hub on another machine over WiFi.
 
 ### Lessons that cost time here
 
@@ -543,6 +670,11 @@ keys: `] [` sync assist, `0 1` knob min/max, `n p` scene, `b`/SPACE blackout, `q
   thing and load it, even without the hardware attached.
 - State what was tested, and how: the mock, the headless browser and the previews
   each prove something specific and nothing more.
+- A control path to a laser is a safety system: assume requests reorder, make the server enforce
+  every limit, and write the test that forces the bad ordering -- then run it against the OLD code
+  to prove the test can fail.
+- `change` is not "the user finished": send on release and use a trailing-edge throttle.
+- Re-running a browser suite against long-lived servers pollutes it (state, logs); start fresh ones.
 
 ## Current state (as of this writing)
 
@@ -558,11 +690,14 @@ patterns (orientation, circle, orient, colors, linearity -- see "Laser").
   network in range; the 19-item menu (WiFi Status, Net Retry).
 - Pi: the 800x480 tile + detail dashboard on the real touch screen; the
   hotspot's stability across reboots.
-- Laser: calibration flags, `ramp`, `show` and all four scenes, OSC input, the
-  Pi-side Helios build. Previewed and mock-tested only.
+- Laser: calibration flags, `ramp`, `show` and all five scenes (incl. `converge`),
+  the OSC and dashboard inputs, the Pi-side Helios build. Previewed and
+  mock-tested only.
+- The hub (dashboard + engine + visualiser + controls): headless-browser and mock-DAC tested
+  only. Not tried on the real DAC/laser, the Pi 3 or the real touch screen.
 
-**Not built:** the hub as one program (OSC -> sync -> visuals -> laser, with a
-sync slider on the dashboard), beat events from the pods, Pi boot automation,
+**Not built:** beat events from the pods, saving the hub's scene/levels across restarts, any
+real authentication on the hub's controls, Pi boot automation,
 USB MIDI reinstatement, the wired Ethernet fallback, any workflow for keeping 6
 physical pods' `net pod` ids straight, menu submenu grouping.
 
@@ -575,9 +710,10 @@ physical pods' `net pod` ids straight, menu submenu grouping.
   changes what "sync" means for the piece (rate vs. phase), which is an artistic
   as much as a technical decision. Telemetry is 15 Hz over WiFi, so beat timing
   would be good to tens of milliseconds, not better.
-- **The hub:** one process owning the OSC port, feeding both the dashboard and the
-  laser; a sync slider on the touch screen. The dashboard and the laser tool
-  currently each want the UDP port the pods send to.
+- **The hub on the real hardware:** does the Pi 3 run engine + OSC + web server + Chromium without
+  late frames? Is the 800x480 layout comfortable to touch? Does the on-screen picture match the
+  beam (orientation, timing)? Is "controls only from this machine" enough, or does the show need
+  a PIN / physical key switch on the arm control?
 - Is the hotspot stable across reboots, and should it get a WPA2 password before
   the show?
 - The CUBE's safe `--pps` and scan size in ILDA mode; whether a Pi 3 renders and

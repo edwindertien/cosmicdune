@@ -68,6 +68,7 @@ class PodInput:
     bpm: float = 0.0
     gsr: float = 0.0          # 0..1 normalised, as sent by the pod
     online: bool = False
+    simulated: bool = False   # True for demo pods (including ones filling empty slots)
 
 
 # ---- inputs ------------------------------------------------------------------
@@ -102,8 +103,11 @@ class DemoInputs:
         for i, b in enumerate(self.BASE):
             bpm = mean + (b - mean) * (1.0 - c) + 0.6 * math.sin(0.7 * t + i)
             gsr = 0.5 + 0.42 * math.sin(TAU * t / (24.0 + 5.0 * i) + 1.3 * i)
-            out.append(PodInput(bpm, gsr, True))
+            out.append(PodInput(bpm, gsr, True, simulated=True))
         return out
+
+    def note(self) -> str:
+        return ""
 
     def close(self) -> None:
         pass
@@ -158,8 +162,94 @@ class OscInputs:
                 out.append(PodInput(st["bpm"], st["gsr"], True) if online else PodInput())
         return out
 
+    def note(self) -> str:
+        return ""
+
     def close(self) -> None:
         self._server.shutdown()
+
+
+def summary_to_pods(summary: Dict) -> List[PodInput]:
+    """The dashboard's per-pod summary ({pod id: {status, bpm, signal, gsr_norm, ...}}, ids as
+    ints or strings) -> six PodInput. ONE definition of 'online' for everything that reads the
+    dashboard: status ok, a pulse signal, and a plausible BPM."""
+    pods = [PodInput() for _ in range(NUM_PODS)]
+    for key, p in summary.items():
+        try:
+            pid = int(key)
+            bpm = float(p.get("bpm", 0))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= pid <= NUM_PODS and p.get("status") == "ok" and p.get("signal") and 30.0 <= bpm <= 220.0:
+            pods[pid - 1] = PodInput(bpm, float(p.get("gsr_norm", 0.0)), True)
+    return pods
+
+
+class DashboardInputs:
+    """Pods as osc_web_dashboard.py sees them: polls <url>/api/summary in a background thread
+    (standard library only; the render loop never waits on HTTP). This is how the laser tool
+    runs ALONGSIDE the dashboard: the dashboard stays the only OSC listener on the pods' UDP
+    port, and the pods need no second hub address."""
+
+    STALE_S = 2.0
+
+    def __init__(self, base_url: str = "http://127.0.0.1:5000", interval: float = 0.1) -> None:
+        self._url = base_url.rstrip("/") + "/api/summary"
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._pods = [PodInput() for _ in range(NUM_PODS)]
+        self._ok_at = -1e9
+        self._stop = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        import json
+        import urllib.request
+        while not self._stop:
+            try:
+                with urllib.request.urlopen(self._url, timeout=1.0) as r:
+                    data = json.loads(r.read().decode())
+                pods = summary_to_pods(data.get("pods", {}))
+                with self._lock:
+                    self._pods = pods
+                    self._ok_at = time.monotonic()
+            except Exception:
+                pass
+            time.sleep(self._interval)
+
+    def _fresh(self) -> bool:
+        return time.monotonic() - self._ok_at < self.STALE_S
+
+    def pods(self, t: float) -> List[PodInput]:
+        with self._lock:
+            return list(self._pods) if self._fresh() else [PodInput() for _ in range(NUM_PODS)]
+
+    def note(self) -> str:
+        with self._lock:
+            return "" if self._fresh() else "DASHBOARD UNREACHABLE"
+
+    def close(self) -> None:
+        self._stop = True
+
+
+class FilledInputs:
+    """Real pods where they are online; simulated pods in every empty slot. For testing with
+    fewer than six units: your one pod (set `net pod 1`) drives slot 1 with its real BPM and
+    GSR colour, and the other five are demo pods."""
+
+    def __init__(self, primary, filler) -> None:
+        self.primary, self.filler = primary, filler
+
+    def pods(self, t: float) -> List[PodInput]:
+        real, fake = self.primary.pods(t), self.filler.pods(t)
+        return [r if r.online else f for r, f in zip(real, fake)]
+
+    def note(self) -> str:
+        return self.primary.note()
+
+    def close(self) -> None:
+        self.primary.close()
+        self.filler.close()
 
 
 # ---- sync --------------------------------------------------------------------
@@ -283,6 +373,25 @@ class Bloom(Scene):
         return [Stroke(pts, colors=colors, smooth=True)]
 
 
+class Converge(Scene):
+    name = "converge"
+    description = ("Six small pulsing rings, one per pod, scattered round a hexagon. As sync rises they all slide "
+                   "to the centre and fuse into ONE spot there, whose pulse grows as they lock together. "
+                   "sync 0: six separate pulses. sync 1: one pulsing spot.")
+
+    def _strokes(self, pods: List[PodInput]) -> List[Stroke]:
+        rho = 0.62 * (1.0 - self.sync)                     # distance of each ring from the centre
+        rmax = 0.28 + 0.30 * self.sync * self.sync        # how big the pulse gets (grows as they lock)
+        circles = []
+        for i, p in enumerate(pods):
+            if not p.online:
+                continue
+            ang = math.radians(90 - 60 * i)
+            r = self.min_r + (rmax - self.min_r) * self.pulse[i]
+            circles.append((rho * math.cos(ang), rho * math.sin(ang), r, self.color(p)))
+        return [self.ring(*c) for c in merge_circles(circles, 0.05)]
+
+
 class Merge(Scene):
     name = "merge"
     description = ("Six small rings, one per pod, each breathing at its own rate and colour, scattered round a "
@@ -335,7 +444,7 @@ class Spokes(Scene):
         return out
 
 
-SCENES: Dict[str, type] = {"bloom": Bloom, "merge": Merge, "ripple": Ripple, "spokes": Spokes}
+SCENES: Dict[str, type] = {"converge": Converge, "merge": Merge, "bloom": Bloom, "ripple": Ripple, "spokes": Spokes}
 
 
 def scene_min_r(size: float) -> float:

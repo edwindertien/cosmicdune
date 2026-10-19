@@ -41,7 +41,11 @@ Pod visuals (needs no pods -- the demo pods scatter, converge and scatter again 
   python3 laser_test.py show merge --dry-run      # try it with no laser, no DAC
   python3 laser_test.py show merge                # for real; ENTER to arm
   python3 laser_test.py show bloom --sync 0.6     # hold sync fixed to tune a look
-  python3 laser_test.py show merge --osc-port 9001   # real pods: `net hub <this ip> 9001` on each
+  python3 laser_test.py show converge --dry-run   # six pulsing rings slide together into one centre spot
+  python3 laser_test.py show converge --dashboard # real pods, read from the dashboard running on this machine
+  python3 laser_test.py show converge --dashboard --fill-demo   # ONE real pod + five simulated ones
+  python3 laser_test.py show merge --osc-port 9001   # alternative: listen for the pods directly (not
+                                                  # while the dashboard is running: one UDP port, one listener)
     live keys:  ] [  raise/lower the sync assist knob     0 / 1  knob to min / max
                 n p  next / previous scene      b or SPACE  blackout (laser off, program keeps running)
                 q  quit
@@ -241,12 +245,12 @@ def cmd_check(args) -> int:
             except P.UnsafeFrame as e:
                 bad += 1
                 print(f"{name:8} REFUSED at t={t}: {e}")
-    print(f"\n{'scene':8} {'sync':>5} {'max pts':>7} {'max ms':>7} {'min ms':>7}  result   (8 s of demo pods each)")
+    print(f"\n{'scene':8} {'sync':>5} {'max pts':>7} {'max ms':>7} {'min ms':>7} {'render ms avg/max':>18}  result   (8 s of demo pods each)")
     cal = calib_from(args)
     for name, cls in V.SCENES.items():
         for sync in (0.0, 0.5, 1.0):
             sc, demo, dt, t = cls(V.scene_min_r(view.size), P.PALETTES.get(getattr(args, "palette", "gsr"), P.gradient)), V.DemoInputs(), 1 / 30.0, 0.0
-            npts, ms, refused = [], [], 0
+            npts, ms, refused, rt = [], [], 0, []
             for k in range(240):
                 t += dt
                 pods = demo.pods(t)
@@ -254,8 +258,10 @@ def cmd_check(args) -> int:
                 if k % 3:
                     continue
                 try:
+                    t0 = time.perf_counter()
                     fr = P.render(sc.strokes(pods), view, args.pps, args.frame_ms, cal)
                     P.validate(fr, view.intensity)
+                    rt.append((time.perf_counter() - t0) * 1000.0)
                     npts.append(len(fr.points))
                     ms.append(fr.duration_ms)
                 except P.UnsafeFrame as e:
@@ -265,8 +271,10 @@ def cmd_check(args) -> int:
                 bad += 1
                 print(f"{name:8} {sync:5.2f}  REFUSED {refused}x: {last}")
             else:
-                print(f"{name:8} {sync:5.2f} {max(npts):7d} {max(ms):7.1f} {min(ms):7.1f}  ok")
+                print(f"{name:8} {sync:5.2f} {max(npts):7d} {max(ms):7.1f} {min(ms):7.1f} {sum(rt) / len(rt):8.1f}/{max(rt):<8.1f}  ok")
     print("all patterns and scenes pass" if not bad else f"{bad} problem(s)")
+    print("(render time must stay well under the frame length, ~30 ms: if the max here is above ~15 ms on the Pi, "
+          "expect 'late' frames in `show`)")
     return 0 if not bad else EXIT_UNSAFE
 
 
@@ -478,13 +486,26 @@ def show_session(args) -> int:
                 sc.update(1 / 30.0, pods, sy)
                 P.validate(P.render(sc.strokes(pods), view, args.pps, args.frame_ms, cal), view.intensity)
     print(f"{args.scene}: pre-flight passed for all scenes (sync 0 / 0.5 / 1).")
+    if args.osc_port and args.dashboard:
+        print("error: use --osc-port OR --dashboard, not both", file=sys.stderr)
+        return EXIT_USAGE
     try:
-        inputs = V.OscInputs(args.osc_port) if args.osc_port else V.DemoInputs(args.demo_speed)
+        if args.dashboard:
+            inputs = V.DashboardInputs(args.dashboard)
+            src = f"live pods via the dashboard at {args.dashboard}"
+        elif args.osc_port:
+            inputs = V.OscInputs(args.osc_port)
+            src = f"live OSC on UDP :{args.osc_port}"
+        else:
+            inputs, src = V.DemoInputs(args.demo_speed), (f"demo (scatter -> converge -> scatter, 90 s cycle, "
+                                                           f"x{args.demo_speed:g})")
+        if args.fill_demo and (args.dashboard or args.osc_port):
+            inputs = V.FilledInputs(inputs, V.DemoInputs(args.demo_speed))
+            src += " + simulated pods in the empty slots"
     except (RuntimeError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return EXIT_DEVICE
-    print("pods: " + (f"live OSC on UDP :{args.osc_port}" if args.osc_port else
-                      f"demo (scatter -> converge -> scatter, 90 s cycle, x{args.demo_speed:g})"))
+    print("pods: " + src)
     dac = open_dac(args)
     keys = None
     try:
@@ -559,9 +580,11 @@ def show_session(args) -> int:
             if now - last_print >= 1.0:
                 last_print = now
                 lo, hi = (min(bpms), max(bpms)) if bpms else (0, 0)
-                print(f"\r  {names[idx]:6} sync {eff:4.2f} (measured {measured:4.2f}, knob {knob:4.2f}{' fixed' if fixed else ''})"
-                      f"  pods {len(bpms)}/6  bpm {lo:3.0f}-{hi:3.0f}  frames {frames} late {late} refused {refused}"
-                      f"{'  [BLACKOUT]' if blackout else ''}     ", end="", flush=True)
+                live = sum(1 for p in pods if p.online and not p.simulated)
+                note = inputs.note()
+                print(f"\r  {names[idx]:8} sync {eff:4.2f} (measured {measured:4.2f}, knob {knob:4.2f}{' fixed' if fixed else ''})"
+                      f"  pods {len(bpms)}/6 (live {live})  bpm {lo:3.0f}-{hi:3.0f}  frames {frames} late {late} refused {refused}"
+                      f"{'  [BLACKOUT]' if blackout else ''}{'  ' + note if note else ''}     ", end="", flush=True)
         print()
     except KeyboardInterrupt:
         print("\nstopping ...")
@@ -633,8 +656,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("show", help="the pod visuals: six pods -> one pulse")
-    p.add_argument("scene", nargs="?", default="merge", help="bloom, merge, ripple or spokes (n/p switch live)")
+    p.add_argument("scene", nargs="?", default="converge", help="converge, merge, bloom, ripple or spokes (n/p switch live)")
     p.add_argument("--osc-port", type=int, default=0, help="listen for the real pods on this UDP port (needs python-osc)")
+    p.add_argument("--dashboard", nargs="?", const="http://127.0.0.1:5000", default=None, metavar="URL",
+                   help="read the pods from a running osc_web_dashboard.py instead (default http://127.0.0.1:5000); "
+                        "lets the dashboard and this tool run side by side")
+    p.add_argument("--fill-demo", action="store_true",
+                   help="simulated pods fill the empty slots, so ONE real pod (net pod N) can be tried among six")
     p.add_argument("--demo-speed", type=float, default=1.0, help="demo pods: speed multiplier (default 1)")
     p.add_argument("--tol-bpm", type=float, default=10.0,
                    help="mean BPM deviation at which measured sync reaches 0 (default 10)")

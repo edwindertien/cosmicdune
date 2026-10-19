@@ -11,7 +11,8 @@ The hub is not one program yet. Its parts exist separately: a Raspberry Pi
 that hosts the pods' WiFi network and runs a touch-screen dashboard
 (`tools/`), and test/visual tools that drive the Helios laser DAC
 (`tools/laser/`). `context.md` says why each is the way it is and where it
-stands.
+stands. **`SETUP.md` is the step-by-step checklist for bringing up one pod and the
+Pi** (hotspot, dashboard, laser).
 
 **Status tags in this file.** *(confirmed)* = seen working on the real
 hardware. *(untested)* = written and checked only in simulation, against a
@@ -25,34 +26,78 @@ SDK download, and on the Pi `apt install libusb-1.0-0-dev g++`.
 ## Repository layout
 
 ```
-cosmic-dune-pod/
+cosmic-dune-pod/             (the repository root: the folder with platformio.ini, src/ and tools/)
+  .gitignore                 keeps the per-machine files out of git (venv, Helios library, caches)
   platformio.ini
+  README.md  SETUP.md  context.md    SETUP = step-by-step bring-up: one pod + the Pi
   src/                       pod firmware (Raspberry Pi Pico W)
     config.h  main.cpp
     drivers/  core/  net/  io/
   tools/
     requirements.txt         python-osc, flask
-    osc_test_hub.py          terminal monitor + fake pods
-    osc_web_dashboard.py     touch-screen dashboard (Flask)
+    osc_test_hub.py          terminal monitor + fake pods (command line)
+    pod_simulator.py         six fake pods with a small browser UI (BPM/GSR sliders, presets)
+    osc_web_dashboard.py     THE HUB: dashboard + laser visualiser + laser controls (Flask)
     chart.umd.js             Chart.js 4.5.1, bundled so the dashboard works offline
     laser/                   Helios DAC -> ILDA laser tools
       laser_test.py  patterns.py  visuals.py  helios_dac.py
+      engine.py              the laser engine the hub runs (frames -> DAC + browser)
       lib/                   the Helios shared library (you add it, see "Laser tools")
 ```
+
+## One branch for Mac and Pi
+
+**There are no Mac and Pi variants of the code, so there is no reason for two branches.** The only
+OS-dependent logic is automatic: `helios_dac.py` looks for `libHeliosLaserDAC.dylib` on macOS and
+`libHeliosDacAPI.so` on Linux, and the hub's address listing uses the Linux `ip` command with a
+fallback elsewhere. Everything else is plain Python (3.9 or newer) and runs the same on both.
+
+What IS per machine -- and therefore never committed (see `.gitignore`):
+
+| per machine | Mac | Pi |
+|---|---|---|
+| Python virtualenv | `tools/.venv`, made on the Mac | `tools/.venv`, made on the Pi (`pip install -r requirements.txt`) |
+| Helios library in `tools/laser/lib/` | the two `.dylib` files from the SDK | a `libHeliosDacAPI.so` you build on the Pi |
+| how you start the hub | usually plain `python osc_web_dashboard.py` (preview) | `--laser --source live --rgb-min ... --auto-disarm 0` for the show |
+| OS setup | none | hotspot, udev rule, kiosk browser (SETUP.md) |
+
+Keep the Pi's start command in a small shell script on the Pi (outside the repo, or untracked), so
+calibration values like `--rgb-min` live next to the machine they were measured on.
+
+**Moving changes from the Mac to the Pi:** edit and test on the Mac, then run the `rsync` command from
+SETUP.md step 1 (it skips the per-machine files and never deletes on the Pi), or `git pull` on the Pi.
+
+**Tracking what changed.** Put the folder under git once, *before* copying in any new files:
+```
+git init && git add -A && git commit -m "baseline"
+```
+After that, anything copied in (from me or from you) shows up as exactly what it is:
+`git status` lists the touched files and `git diff` shows the lines. Commit when it works
+(`git commit -am "..."`), `git log --stat` is the history, and `git checkout -- <file>` undoes a bad
+copy. Hardware variants (e.g. a Pico 2 W instead of a Pico W) belong in `platformio.ini` as separate
+`[env:...]` sections, not in a branch.
 
 ## How the pieces connect
 
 ```
 pods (Pico W) --WiFi, OSC over UDP :9000--> Raspberry Pi, hosting the WiFi network (10.42.0.1)
-                                             |- osc_web_dashboard.py   web page :5000 (800x480 touch screen)
-                                             '- (planned) hub process --USB--> Helios DAC --ILDA--> Laserworld CUBE 3
+                                             '- osc_web_dashboard.py  = THE HUB, one process:
+                                                  OSC in -> pod state -> laser engine -> frames
+                                                  |- web page :5000 (800x480): visualiser + pods + controls
+                                                  '- (with --laser) Helios DAC --ILDA--> Laserworld CUBE 3
 ```
 
-Today the laser tools run on their own (on a Mac first) and either take
-their own OSC input (`show --osc-port`) or use simulated pods. A pod has
-exactly one hub address, and only one program can listen on a UDP port --
-so until the single hub process exists, the dashboard and the laser tool
-can't both receive the real pods at once.
+`osc_web_dashboard.py` is now the operating console: it receives the pods, runs the
+laser engine (`laser/engine.py`) and serves a page that shows **exactly the frames
+the engine hands to the DAC**. Without `--laser` it only *previews* (nothing is sent
+anywhere), which doubles as a **dummy mode** for trying patterns with no pod and no
+laser.
+
+`laser/laser_test.py` stays as the bench/calibration tool (first light, `ramp`,
+`--blank-shift`, ...). **Only one program can hold the USB DAC**: stop the hub
+before using `laser_test.py` with the laser, and vice versa. `laser_test.py show
+--dashboard` still works against a hub running in preview mode (it reads the hub's
+`/api/summary`).
 
 ## Wiring
 
@@ -299,38 +344,85 @@ Rules that matter:
 - Full-screen browser: `chromium-browser --kiosk http://localhost:5000`
   (`chromium` on newer images).
 
-### Dashboard: `tools/osc_web_dashboard.py`
-Receives the pods' OSC and serves a page built for the 800x480 touch screen.
-*(untested on the real screen; checked in a headless browser at exactly
-800x480 with simulated pods)*
-
-- **Grid:** six fixed tiles, pod 1-6. Each shows BPM (large), a GSR meter in the
-  same colours as the pod's LED strip (white, blue, purple, red), and the state:
-  green = online, amber = `no pulse`, red = `OFFLINE <s>` (nothing heard for
-  3 s), greyed and not tappable = never heard from. The header counts
-  `n / 6 online`; the footer prints the `net hub <ip> <port>` line for each of
-  the Pi's addresses, to copy onto a pod.
-- **Detail:** tap a tile for that pod's BPM graph (fixed 30-180) and GSR graph
-  (0-1) over the last 60 s, plus IBI, pulse signal, raw GSR, level, IP and time
-  since the last packet. The Back button (or Esc) returns to the grid.
-- Pod ids above 6 are received but not shown (the pod CLI only allows 1-6).
+### The hub: `tools/osc_web_dashboard.py` (dashboard + laser visualiser + controls)
+One process: receives the pods' OSC, runs the laser engine, serves one page built
+for the 800x480 touch screen. *(untested on the real screen and on the Pi; checked in
+a headless browser at exactly 800x480 against a mock DAC and simulated pods)*
 
 ```
 cd tools
-python osc_web_dashboard.py [--osc-port 9000] [--web-port 5000]
+python osc_web_dashboard.py                  # PREVIEW: visualiser + dashboard, nothing sent to any laser
+python osc_web_dashboard.py --laser          # also drives the Helios DAC (starts SAFE; ARM on screen)
+python osc_web_dashboard.py --laser --source live --rgb-min 0.25,0.4,0.15 --auto-disarm 0
 ```
-Run it as a script, **not** with `flask run` -- the OSC listener is started by
-the script, and `flask run` binds to localhost only. The page works from
-`http://<the Pi>:5000` on any device on the hotspot.
+Run it as a script, **not** with `flask run` (the OSC listener and the engine are
+started by the script). The page works from `http://<the Pi>:5000`. Calibration and
+shape options are the same as `laser_test.py` (`--size --intensity --pps --rgb-min
+--blank-shift --settle --travel-step --flip-x ...`). It needs the `laser/` folder
+next to it; without it the pods and graphs still work and the page says the
+visualiser is unavailable.
 
-**Offline:** it loads nothing from the internet. `chart.umd.js` must sit next to
-the script; if it is missing, the tiles and numbers still work and the graph
-area says so. (An earlier version loaded Chart.js from a CDN; on the hotspot
-there was no internet, the page's script crashed before it started polling,
-and the page stayed blank while the server was receiving data fine.)
+**Screen layout.**
+- **Left, always:** the *visualiser*, a live drawing of the frames the engine sends
+  to the DAC (same points, after calibration: orientation, `--rgb-min`, blank
+  shift), with a persistence fade. Chip: `PREVIEW`, `LASER DARK` (safe), `ARMED` or
+  `LASER ERROR`, plus the source. `ZOOM` magnifies a small pattern. A big red
+  `BLACKOUT` appears on the visualiser whenever the laser is armed.
+- **Right, tab PODS:** six compact tiles (BPM, GSR meter in the LED strip's colours,
+  online / `no pulse` / `OFFLINE` / never heard). The same six show as pills in the
+  header; tap either for the full-screen detail (BPM and GSR graphs for the last
+  60 s, IBI, raw GSR, IP, time since the last packet). Pod ids above 6 are received
+  but not shown.
+- **Right, tab LASER:** source `LIVE | FILL | DEMO`; 15 buttons (5 scenes, 10 test
+  patterns); sliders `SYNC` (with `AUTO | HOLD`), `SIZE`, `LEVEL`; `ARM` and `BLACKOUT`.
 
-For debugging, `curl http://<pi>:5000/api/summary` (all pods, no history),
-`/api/pod/<id>` (one pod with 60 s history), `/api/data` (everything), `/api/info`.
+**Dummy mode.** Source **DEMO** feeds the scenes with six simulated pods (they
+scatter, converge and scatter again every 90 s); the test patterns need no pods at
+all. So everything can be tried with no pod connected, and with no laser at all.
+**FILL** uses the real pods where they are online and simulated ones elsewhere (one
+real pod among six: set it with `net pod 1`); **LIVE** uses only real pods (an idle
+ring when none). Start in a given mode with `--source`. SYNC: in **AUTO** the slider
+is an *assist* on top of how alike the pods' BPMs are (the label shows
+`slider > effective`); in **HOLD** the slider *is* the sync. For the `rays` pattern
+the slider is its sync.
+
+**Safety model** (the page is a remote control for a laser, so the server decides):
+- No `--laser`: PREVIEW only; no DAC is opened.
+- With `--laser`: starts **SAFE** (dark). Frames reach the DAC only while **ARMED**;
+  ARM needs **two taps** (the first only asks, and expires after 3 s). BLACKOUT is
+  immediate and disarms.
+- `LEVEL` and `SIZE` are clamped **on the server** to `--max-intensity` (default 0.3;
+  above 0.5 needs `--allow-high`) and `--max-size` (default 0.6); the smallest
+  accepted size is 0.10. A client asking for more still gets the limit.
+- **Who may control:** in preview anyone (it only changes a drawing). With `--laser`
+  only the hub's own machine (the Pi's touch screen); other devices on the hotspot
+  get a view-only visualiser, because the hotspot is open. `--allow-remote-control`
+  overrides this -- do not use it on an open network.
+- Auto-disarm after `--auto-disarm` minutes (default 20; 0 = never) without any
+  control activity; **set `--auto-disarm 0` for a show**, or it will go dark mid-show.
+- A DAC error disarms and latches an error (restart the hub); every frame is still
+  validated, and the DAC runs in fail-dark `SINGLE_MODE`. Control requests from the
+  page are sent strictly in order (an old ARM can never overtake a newer BLACKOUT).
+
+**Restarting the hub** resets what you chose on screen to the start-up defaults: source
+**DEMO**, scene `converge`, SYNC 0 in AUTO. To come back in another state, say so in the start
+command (`--source live` or `fill`, `--scene`, `--sync`). A browser tab left open recovers by
+itself after a restart (no refresh needed); the pods and the picture resume.
+
+**Offline:** it loads nothing from the internet. `chart.umd.js` must sit next to the
+script; if it is missing, tiles and numbers still work and the graph area says so.
+
+**How in sync is the picture?** The browser is shown the engine's newest frame,
+pushed as soon as it exists. In the (loaded) test VM the drawing was at the engine's
+frame at the median, within 2-3 frames (60-90 ms) 90 % of the time, with occasional
+spikes of 4-6 frames. The DAC plays a frame about one frame after the engine
+produces it, so expect the picture and the laser to differ by tens of milliseconds
+at most. *(Pi 3: untested)*
+
+For debugging with curl: `/api/summary`, `/api/pod/<id>`, `/api/data`, `/api/info`,
+`/api/laser/state`, `/api/laser/frame.bin?since=<seq>` (8-byte header + 8 bytes per
+point, the same x12/y12/r/g/b the DAC gets), `POST /api/laser/control` (JSON, needs
+the header `X-Cosmic: 1`).
 
 ### Test tools: `tools/osc_test_hub.py`
 `pip install -r tools/requirements.txt`, then:
@@ -340,10 +432,40 @@ For debugging, `curl http://<pi>:5000/api/summary` (all pods, no history),
   dashboard (and the laser tool's `show --osc-port`) can be tried with no
   hardware. Both listen on the same default port, so run one listener at a time.
 
+### Pod simulator: `tools/pod_simulator.py`
+Six fake pods with a small UI (`http://127.0.0.1:5100`, fits 800x480), sending real
+UDP/OSC to the hub, so you can **steer the heart rates by hand** and watch the hub's
+LIVE source, the measured sync and the laser visuals respond. It sends exactly what the
+firmware sends (`/pod/<id>/bpm`, `ibi`, `signal`, `gsrRaw`, `gsr`, same types, 15 Hz).
+*(tested against the real hub and a headless browser; not against real pods side by side)*
+
+```
+python3 pod_simulator.py                    # hub on this machine, UDP :9000
+python3 pod_simulator.py --host 10.42.0.1   # hub on the Pi, simulator on your Mac (same hotspot)
+python3 pod_simulator.py --off 1            # pod 1 is a REAL pod: don't simulate it
+```
+- Per pod: **ON/OFF** (OFF = stops sending, so the hub shows `OFFLINE` after 3 s), a **BPM**
+  slider (30-200), a **GSR** slider, and **PULSE / NO PULSE** (sends `signal 0`; the BPM keeps
+  being sent, as on a real pod).
+- **CONVERGE** glides all pods to their common mean over `GLIDE` seconds (0 = instant);
+  **SCATTER** returns them to a 56-102 spread; **WANDER** adds slow drift (about 2 BPM,
+  0.08 GSR); **ALL ON / ALL OFF**; **PAUSE**; target host/port/rate (a bad host shows an error).
+- In the hub choose source **LIVE** (or **FILL** to mix with real pods) to see the simulated
+  pods drive the scenes and the sync.
+- **No IP spoofing is needed.** The hub identifies a pod by the id in the OSC address, not by
+  the sender's IP; it only records the IP to show in a pod's detail view. All six simulated
+  pods therefore come from one address (and show the same IP). `--distinct-ips` sends pod N
+  from `127.0.0.<N+1>` so each tile shows its own address -- cosmetic, only for a hub on the
+  same machine, works out of the box on Linux; on macOS it needs `sudo ifconfig lo0 alias
+  127.0.0.2` ... `.7` first, otherwise it falls back to one address *(macOS untested)*.
+- Real pods use the same ids 1-6: switch the matching simulated pod OFF (or `--off`) while a
+  real pod is connected. The UI listens on this machine only unless you pass `--bind 0.0.0.0`.
+
 ## Laser tools: `tools/laser/` (Helios DAC -> Laserworld CUBE 3 over ILDA)
 
-Standalone: no sensors, no network, no extra Python packages (only
-`python-osc` for `show --osc-port`). Runs the same on a Mac and on the Pi.
+The bench/calibration tool: standalone, no sensors, no network, no extra Python
+packages (only `python-osc` for `show --osc-port`). Runs the same on a Mac and on
+the Pi. The hub above runs the same patterns and scenes with a browser front end.
 **`python3 laser_test.py -h` prints the complete setup, calibration and safety
 notes**; this section is the short version.
 
@@ -452,6 +574,7 @@ to a big one and back.
 
 | Scene | sync 0 | sync 1 |
 |---|---|---|
+| `converge` | six small pulsing rings round a hexagon, each in its pod's colour | all slid to the centre and fused into one centre spot, whose pulse grows |
 | `merge` | six small rings round a hexagon, each in its pod's colour | one big ring pulsing as one |
 | `bloom` | one ring in six sectors, one per pod (pod 1 at the top, clockwise) | a single round ring |
 | `ripple` | six concentric rings | one ring |
@@ -459,10 +582,13 @@ to a big one and back.
 
 ```
 python3 laser_test.py preview scenes --t 6      # PNG: every scene at sync 0..1
-python3 laser_test.py show merge --dry-run      # no laser, no DAC
-python3 laser_test.py show merge                # demo pods; ENTER to arm
+python3 laser_test.py show converge --dry-run   # no laser, no DAC
+python3 laser_test.py show converge             # demo pods; ENTER to arm
+python3 laser_test.py show converge --dashboard # real pods, read from the running dashboard
+python3 laser_test.py show converge --dashboard --fill-demo   # one real pod (net pod 1) + five simulated
 python3 laser_test.py show bloom --sync 0.6     # fix the sync to tune a look
-python3 laser_test.py show merge --osc-port 9001   # real pods: `net hub <this ip> 9001`
+python3 laser_test.py show merge --osc-port 9001   # alternative: listen to the pods directly
+                                                # (only while the dashboard is NOT running)
 ```
 Demo pods scatter, converge and scatter again on a 90 s cycle. **Where sync
 comes from:** *measured* = how alike the pods' BPMs are (0 when they average
@@ -500,16 +626,21 @@ Pod firmware and hardware:
   fed around the call, but if you see short stalls at connect time, check the
   core version.
 
-Pi and dashboard:
-- **The 800x480 dashboard on the real touch screen:** touch ergonomics, the
-  Chromium kiosk, and Pi 3 performance. (Layout was checked headlessly.)
+Pi and hub:
+- **The 800x480 hub on the real touch screen:** touch ergonomics, the Chromium
+  kiosk, and Pi 3 performance (the engine, the OSC listener, the web server and
+  Chromium share one small computer; a late frame is a flicker). Layout, clicks,
+  drags, ARM/BLACKOUT and the control-ordering fix were checked in a headless
+  browser against a mock DAC.
+- **The hub driving the real DAC:** `--laser`, ARM/BLACKOUT and the auto-disarm have
+  only been exercised against a mock Helios library.
 - **Hotspot stability across reboots.** The cause of the earlier
   start/vanish/rejoin-home-WiFi flapping was not pinned down; the single-profile
   recipe above is the recommended fix, not a confirmed one.
 
 Laser:
 - **Everything after the first bench round** (calibration flags, `ramp`, `show`,
-  the OSC input, the corrected Pi build line) has only been run against a mock
+  `converge`, the OSC and dashboard inputs, the corrected Pi build line) has only been run against a mock
   Helios library, a real SDK build with no DAC attached, and rendered previews.
 - Whether the diode-threshold explanation for `sweep`/`rays` is right; `ramp`
   measures it.
@@ -529,15 +660,16 @@ on the hotspot was its CDN dependency. See `context.md` for each story.
 
 ## Deliberately deferred (not in this iteration)
 
-- **The hub as one program:** OSC in -> sync -> visuals -> laser out, with the
-  dashboard showing the sync and a sync slider on the touch screen. The
-  pieces exist; they are not joined.
+- **Hub polish:** the hub exists (dashboard + engine + visualiser + controls) but is
+  untested on the real laser and Pi. Not built: saving the chosen scene/levels across
+  restarts, a sync *measurement* that uses beat events (below), and any
+  authentication beyond "controls only from this machine".
 - **Beat events from the pods** (a small firmware addition: send a message at
   each detected beat). Without it, "sync" can only mean similar heart *rates*;
   with it, the laser could fire on the musicians' actual heartbeats and measure
   real beat-phase coherence.
-- **Pi boot automation:** starting the dashboard (and later the hub) at power-on,
-  and the Helios library build + udev rule on the Pi.
+- **Pi boot automation:** starting the hub at power-on, and the Helios library build
+  + udev rule on the Pi.
 - **USB MIDI** -- removed while debugging an unrelated CLI issue (see
   `context.md`); not yet reinstated.
 - **Wired telemetry path** -- discussed (a WIZnet W5500 Ethernet module
