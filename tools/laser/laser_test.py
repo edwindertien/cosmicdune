@@ -695,6 +695,103 @@ def cmd_usbtest(args) -> int:
     return 0 if errs == 0 else EXIT_DEVICE
 
 
+def cmd_streamtest(args) -> int:
+    """Stream DARK fixed-size frames with NO engine involved until the DAC stops answering; then leave it completely alone and measure how
+    long it stays silent and whether it recovers by itself. --mode poll asks 'ready?' before every frame (like the engine); --mode timed
+    writes on a fixed period and NEVER polls the status, so comparing the two shows whether polling during streaming is what sets it off."""
+    import math
+    import statistics
+    if args.dry_run:
+        print("streamtest: (dry run: no DAC to stream to)")
+        return 0
+    n, pps = args.points, args.pps
+    pts = [(int(2048 + 700 * math.cos(2 * math.pi * k / n)), int(2048 + 700 * math.sin(2 * math.pi * k / n)), 0, 0, 0) for k in range(n)]
+    period = n / float(pps)
+    dac = open_dac(args)
+    episodes: List[dict] = []
+    streamed_total = 0.0
+
+    def reopen():
+        nonlocal dac
+        try:
+            dac.close()
+        except Exception:
+            pass
+        try:
+            dac = open_dac(args)
+            return True
+        except HeliosError:
+            return False
+
+    try:
+        print(f"DAC    : {dac.name or '(unnamed)'}  firmware {dac.firmware}  ({dac.lib_path})")
+        print(f"streamtest, mode {args.mode}: {n} DARK points per frame ({1000 * period:.1f} ms), budget {args.seconds:g} s, up to {args.cycles} failure(s) "
+              f"({'asks ready? before each frame' if args.mode == 'poll' else 'fixed timing, NO status polling at all'})")
+        end = time.monotonic() + args.seconds
+        while time.monotonic() < end and len(episodes) < args.cycles:
+            streak0 = time.monotonic()
+            nxt = streak0
+            frames = 0
+            err = None
+            while time.monotonic() < end:
+                try:
+                    if args.mode == "poll":
+                        dac.wait_ready(1.0, poll_s=0.001)
+                    dac.write(pts, pps, assume_ready=True)
+                    frames += 1
+                    if args.mode == "timed":
+                        nxt += period + 0.0015
+                        time.sleep(max(0.0, nxt - time.monotonic()))
+                except HeliosError as e:
+                    err = e
+                    break
+            streamed = time.monotonic() - streak0
+            streamed_total += streamed
+            if err is None:
+                break
+            t_fail = time.monotonic()
+            where = "GetStatus" if "GetStatus" in str(err) else "WriteFrame"
+            time.sleep(args.quiet_ms / 1000.0)                  # the DAC is left completely alone for a while
+            reopened, recovered, st = 0, False, 0
+            while time.monotonic() - t_fail < args.give_up_s:
+                try:
+                    st = dac.status_raw()
+                except HeliosError:
+                    st = -1000                                  # (our handle is closed)
+                if st >= 0:
+                    recovered = True
+                    break
+                if st == -1000:
+                    reopened += 1
+                    reopen()
+                time.sleep(args.watch_ms / 1000.0)
+            silent = time.monotonic() - t_fail
+            ep = {"streamed": streamed, "frames": frames, "where": where, "error": str(err).split(": ", 1)[-1], "silent": silent if recovered else None,
+                  "reopened": reopened, "recovered": recovered}
+            episodes.append(ep)
+            print(f"cycle {len(episodes)}: streamed {streamed:.1f} s ({frames} frames), then {where} failed: {ep['error']}; "
+                  + (f"the DAC was silent for {silent:.1f} s" if recovered else f"NOT recovered after {args.give_up_s:g} s: it needs a replug")
+                  + (f" [the SDK closed the device; reopened x{reopened}]" if reopened else "") + ("; recovered by itself" if recovered else ""))
+            if not recovered:
+                break
+            try:
+                dac.stop()
+            except Exception:
+                pass
+    finally:
+        dac.close()
+    f = len(episodes)
+    if f == 0:
+        print(f"RESULT mode {args.mode}: 0 failures in {streamed_total:.1f} s of streaming.")
+        return 0
+    silent = sorted(e["silent"] for e in episodes if e["silent"] is not None)
+    rec = len(silent)
+    tail = (f"; silent for {silent[0]:.1f} / {statistics.median(silent):.1f} / {silent[-1]:.1f} s (min / median / max)" if silent else "")
+    print(f"RESULT mode {args.mode}: {f} failure(s) in {streamed_total:.1f} s of streaming ({60.0 * f / max(streamed_total, 0.001):.1f} per minute)"
+          f"{tail}; recovered unaided {rec} of {f}" + ("" if rec == f else f" (the rest stayed silent for the full {args.give_up_s:g} s: replug needed)") + ".")
+    return EXIT_DEVICE
+
+
 def _machine_line() -> str:
     import platform
     parts = [f"{platform.system()} {platform.machine()}", f"Python {platform.python_version()}", f"{os.cpu_count()} cores"]
@@ -992,6 +1089,18 @@ def _diag_sub(args, sub_args: List[str], timeout: float):
         return "", "did not finish in time", -1
 
 
+def _diag_settle(args) -> float:
+    """After a stage that may have hung the DAC: wait (up to 30 s) until it answers again, and report how long that took. Without this the next stage
+    starts on a DAC that is still silent (what happened in the first Pi 4 report) and is blamed for it."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 30:
+        _o, _e, rc = _diag_sub(args, ["usbtest", "--seconds", "0.6", "--interval-ms", "100"], 40)
+        if rc == 0:
+            break
+        time.sleep(1.0)
+    return time.monotonic() - t0
+
+
 def _diag_bench(args, mode: str, seconds: float):
     import subprocess
     cmd = [sys.executable, os.path.abspath(__file__), "bench", args.scene, "--seconds", str(seconds), "--usb-polling", mode,
@@ -1078,9 +1187,31 @@ def cmd_diag(args) -> int:
             groups, n_lines, other = _group_libusb(err, limit=40, only_informative=args.libusb_debug >= 3)
             idles.append({"ms": ms, "out": out, "rc": rc, "m": m, "groups": groups, "n": n_lines, "err": err.strip()[-200:]})
             print((f"{m.group(2)} errors in {m.group(1)} polls (worst poll {m.group(4)} ms)" if m else f"no result ({idles[-1]['err'] or 'rc ' + str(rc)})"))
+    streams, settles = [], []
+    dead = [False]                                              # the DAC stopped answering for good: do not wait for it before every stage
+
+    def settle(label: str) -> None:
+        if dead[0]:
+            settles.append((label + " (not waited for: the DAC never came back)", 0.0))
+            return
+        w = _diag_settle(args)
+        settles.append((label, w))
+        if w >= 29.5:
+            dead[0] = True
+
+    if args.stream_seconds > 0:
+        for mode in ("poll", "timed"):
+            settle(f"before the {mode} stream test")
+            print(f"  streaming DARK frames without the engine, mode {mode} ({'asks ready? before each frame' if mode == 'poll' else 'NO status polling'}), "
+                  f"up to {args.stream_seconds:g} s ... ", end="", flush=True)
+            out, err, rc = _diag_sub(args, ["streamtest", "--mode", mode, "--seconds", str(args.stream_seconds), "--cycles", "2", "--give-up-s", "30"], args.stream_seconds + 150)
+            res = next((l for l in out.splitlines() if l.startswith("RESULT")), "RESULT: (no result: " + (err.strip()[-100:] or f"exit {rc}") + ")")
+            streams.append({"mode": mode, "out": out, "rc": rc, "res": res})
+            print(res.replace("RESULT ", ""))
     runs: "dict[str, list]" = {"adaptive": [], "fast": []}
     for r in range(rounds):
         for mode in ("adaptive", "fast"):
+            settle(f"before round {r + 1} {mode}")
             print(f"  round {r + 1}/{rounds}, DAC polling {mode} ... ", end="", flush=True)
             out, err, rc = _diag_bench(args, mode, seg)
             facts = _bench_facts(out)
@@ -1102,6 +1233,13 @@ def cmd_diag(args) -> int:
     for mode, a in agg.items():
         summary.append(f"  {mode:9} {a['errors']:>10} {a['per_min']:>11.1f} {num(a['polls'], '{:.1f}'):>12} {num(a['poll_avg']) + '/' + num(a['poll_max']):>15} "
                        f"{num(a['write_max']):>12} {num(a['load'], '{:.0f}') + ' %':>6} {num(a['sent']):>9}  {a['ok']}/{rounds}")
+    for s in streams:
+        summary.append("  " + s["res"].replace("RESULT ", "stream test, ", 1))
+    slow = [(w, s) for w, s in settles if s > 3.0]
+    if dead[0]:
+        summary.append("  !! the DAC stopped answering and did NOT come back within 30 s: it needs a replug (later stages ran on a dead DAC)")
+    if settles:
+        summary.append("  time the DAC needed to answer again before each stage: " + (", ".join(f"{w} {s:.0f} s" for w, s in slow) if slow else "all under 3 s"))
     if probes:
         names = collections.Counter(p["name"] for p in probes)
         summary.append(f"  probes x{len(probes)} (name + firmware, control path only): {sum(1 for p in probes if p['rc'] == 0)} ok, "
@@ -1123,6 +1261,11 @@ def cmd_diag(args) -> int:
         summary += [f"    {n:4d} x {k}" for k, n in kinds.most_common(10)]
     summary += ["  " + ln for ln in system if ln.startswith(("throttled", "Helios USB", "   speed", "board", "parent (hub)", "   shares that hub", "Helios library", "   prints"))]
     body: List[str] = ["cosmic dune -- USB diagnostics", "=" * 60, ""] + summary + ["", "=" * 60, "SYSTEM", "=" * 60] + system
+    if streams:
+        body += ["", "=" * 60, "STREAMING dark fixed-size frames, no engine (silence and recovery)", "=" * 60]
+        for s in streams:
+            body += [f"-- mode {s['mode']} --", s["out"].strip()[:2500]]
+        body += ["-- settle waits (how long the DAC needed to answer again) --"] + [f"  {w}: {sw:.1f} s" for w, sw in settles]
     if probes or idles:
         body += ["", "=" * 60, "PROBES and IDLE POLLING (no frames)", "=" * 60]
         for i, p in enumerate(probes, 1):
@@ -1223,6 +1366,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=int, default=0, help="DAC number if several are connected")
     p.set_defaults(fn=cmd_usbtest)
 
+    p = sub.add_parser("streamtest", help="stream DARK frames without the engine until the DAC stops answering; measure how long it stays silent")
+    p.add_argument("--mode", choices=("poll", "timed"), default="poll",
+                   help="poll = ask 'ready?' before each frame (like the engine); timed = fixed timing, never poll the status")
+    p.add_argument("--seconds", type=float, default=60.0, help="total time budget (default 60)")
+    p.add_argument("--cycles", type=int, default=3, help="stop after this many failures (default 3)")
+    p.add_argument("--points", type=int, default=570, help="points per frame (default 570, ~28.5 ms at 20000 pps)")
+    p.add_argument("--pps", type=int, default=20000)
+    p.add_argument("--quiet-ms", type=float, default=500.0, help="after a failure, leave the DAC completely alone this long (default 500)")
+    p.add_argument("--watch-ms", type=float, default=250.0, help="then ask 'ready?' this often until it answers (default 250)")
+    p.add_argument("--give-up-s", type=float, default=60.0, help="if it has not answered after this long: needs a replug (default 60)")
+    p.add_argument("--dry-run", action="store_true", help="no DAC at all")
+    p.add_argument("--lib", help="path to the Helios library (or set $HELIOS_LIB)")
+    p.add_argument("--device", type=int, default=0, help="DAC number if several are connected")
+    p.set_defaults(fn=cmd_streamtest)
+
     p = sub.add_parser("bench", help="can this computer feed the DAC? (output stays DARK; run it on the Mac and on the Pi)")
     p.add_argument("scene", nargs="?", default="converge", help="the scene to build (default converge, the heaviest)")
     p.add_argument("--seconds", type=float, default=15.0, help="measuring time after a 2 s warm-up (default 15)")
@@ -1241,6 +1399,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("scene", nargs="?", default="converge", help="scene used for the load (default converge)")
     p.add_argument("--seconds", type=float, default=60.0, help="measuring time PER POLLING MODE in total, split over the rounds (default 60)")
     p.add_argument("--idle-seconds", type=float, default=10.0, help="length of each idle-polling test (no frames), run at 3 ms and 30 ms (default 10; 0 = skip)")
+    p.add_argument("--stream-seconds", type=float, default=40.0, help="budget of each of the two streaming tests without the engine (poll, timed; default 40; 0 = skip)")
     p.add_argument("--probes", type=int, default=3, help="how many times to read the DAC's name and firmware first (default 3; 0 = skip)")
     p.add_argument("--rounds", type=int, default=2, help="how many times each mode is run, interleaved adaptive, fast, adaptive, fast ... (default 2)")
     p.add_argument("--out", help="the report file (default diag_<host>_<time>.txt in the current folder)")
