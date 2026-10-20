@@ -74,7 +74,8 @@ class LaserEngine:
                  scene: str = "converge", sync: float = 0.0, sync_mode: str = "auto",
                  max_intensity: float = 0.3, max_size: float = 0.6, auto_disarm_s: float = 1200.0,
                  bpm: float = 72.0, tol_bpm: float = 10.0, demo_speed: float = 1.0,
-                 min_extent: float = 0.0, max_stale_s: float = 0.2, usb_grace_s: float = 1.0, viz_fps: float = 30.0) -> None:
+                 min_extent: float = 0.0, max_stale_s: float = 0.2, usb_grace_s: float = 1.0, viz_fps: float = 30.0,
+                 adaptive_poll: bool = True, usb_log: Optional[Callable[[str], None]] = None) -> None:
         self.summary_fn, self.base_view, self.cal = summary_fn, view, cal
         self.pps, self.frame_ms, self.palette = pps, frame_ms, palette
         self.dac = dac
@@ -84,6 +85,11 @@ class LaserEngine:
         self.max_stale_s = max(0.05, float(max_stale_s))  # no new frame for this long while armed -> the writer goes dark
         self.usb_grace_s = max(0.1, float(usb_grace_s))   # transient USB errors (timeouts...) are ridden out for this long
         self.viz_fps = max(2.0, float(viz_fps))           # the visualiser's fetch rate ceiling (it backs off when the hub is overloaded)
+        self.adaptive_poll = bool(adaptive_poll)          # False = the old way: poll the DAC every 0.5 ms (more USB traffic)
+        self._usb_log = usb_log                           # called (from the writer thread) with one line per USB event
+        self._usb_events: collections.deque = collections.deque(maxlen=50)    # the LAST events
+        self._usb_first: List[str] = []                                       # the FIRST events (how the trouble started)
+        self._usb_kinds: collections.Counter = collections.Counter()          # error text -> how often
         self.dac_ok = dac is not None
         self._mb_lock = threading.Lock()
         self._mb: Tuple[int, Optional[List], float] = (0, None, 0.0)   # newest frame for the writer: (seq, points, built at)
@@ -192,7 +198,8 @@ class LaserEngine:
             "build_max_ms": round(s["build_max_ms"], 1), "load": round(s["load"], 2),
             "max_stale_ms": int(self.max_stale_s * 1000), "usb": self._usb_stats(),
             "usb_errors": s["usb_errors"], "last_usb_error": s["last_usb_error"], "viz_ms": self._viz_ms(s["load"]),
-            "stages": self._stages(),
+            "stages": self._stages(), "usb_events": list(self._usb_events)[-6:], "adaptive_poll": self.adaptive_poll,
+            "usb_kinds": dict(self._usb_kinds.most_common(6)),
             "armed_for_s": round(now - arm_time, 1) if c["armed"] else None,
             "auto_disarm_in_s": round(remaining, 1) if remaining is not None else None,
             "error": err, "note": note,
@@ -207,6 +214,15 @@ class LaserEngine:
         if not h:
             return {n: 0.0 for n in names}
         return {n: round(1000.0 * sum(x[i] for x in h) / len(h), 2) for i, n in enumerate(names)}
+
+    def usb_events_all(self, limit: int = 20) -> List[str]:
+        """The first and the last USB events (at most `limit` lines), for a compact report."""
+        first, last = list(self._usb_first), [e for e in self._usb_events if e not in self._usb_first]
+        evs = first + last
+        if len(evs) > limit:
+            half = max(1, limit // 2)
+            evs = evs[:half] + ["   ... (events in between left out) ..."] + evs[-half:]
+        return evs
 
     def _viz_ms(self, load: float) -> int:
         """How often the page should fetch a frame. The laser has priority over the screen: when the hub cannot keep
@@ -304,19 +320,40 @@ class LaserEngine:
         dark = False                                    # output currently stopped because frames went missing
         busy_until = last_dur = 0.0                     # host-side model of the DAC's queue: when it will want the next frame
         err_since = 0.0                                 # start of the current run of transient USB errors (0 = none)
+        run_n = 0                                       # errors in the current run
+        last_write_t = 0.0                              # when the last frame was handed over successfully
 
-        def survive(e: Exception) -> bool:
+        def note(text: str) -> None:
+            line = f"{time.strftime('%H:%M:%S')}.{int(time.time() * 1000) % 1000:03d} {text}"
+            self._usb_events.append(line)
+            if len(self._usb_first) < 10:
+                self._usb_first.append(line)
+            if self._usb_log:
+                try:
+                    self._usb_log(line)
+                except Exception:
+                    pass
+
+        def survive(e: Exception, stage: str) -> bool:
             """A transient USB error (timeout, busy, interrupted ...) is ridden out for usb_grace_s: count it, back off,
             try again with the next frame. Anything else, or a run that lasts too long, is a real failure."""
-            nonlocal err_since, busy_until
-            if not getattr(e, "transient", False):
-                return False
+            nonlocal err_since, busy_until, run_n
             now = time.monotonic()
+            gap = f"{1000 * (now - last_write_t):.0f} ms after the last frame" if last_write_t else "before the first frame"
+            if not getattr(e, "transient", False):
+                note(f"USB FATAL while {stage}: {e}  ({gap})")
+                self._usb_kinds[f"FATAL {'GetStatus' if 'GetStatus' in stage else 'WriteFrame'}: {str(e).split(': ', 1)[-1]}"] += 1
+                return False
             err_since = err_since or now
+            run_n += 1
             with self._lock:
                 self._s["usb_errors"] += 1
                 self._s["last_usb_error"] = str(e)
+                total = self._s["usb_errors"]
+            self._usb_kinds[f"{'GetStatus' if 'GetStatus' in stage else 'WriteFrame'}: {str(e).split(': ', 1)[-1]}"] += 1
+            note(f"USB error #{total} while {stage}: {e}  ({gap}; {run_n}{'st' if run_n == 1 else 'nd' if run_n == 2 else 'rd' if run_n == 3 else 'th'} in a row)")
             if now - err_since > self.usb_grace_s:
+                note(f"USB errors lasted over {self.usb_grace_s:g} s: giving up")
                 return False
             busy_until = 0.0
             self._stop.wait(0.005)
@@ -331,22 +368,22 @@ class LaserEngine:
                     dac.stop()
                 except Exception as e:                  # a failing Stop must not kill the writer
                     self._fail(str(e))
-                last_sent, dark, busy_until, err_since = 0, False, 0.0, 0.0
+                last_sent, dark, busy_until, err_since, run_n = 0, False, 0.0, 0.0, 0
             if not armed or not self.dac_ok:
                 self._stop.wait(0.005)
                 continue
-            if has_wait:                                # polling the DAC over USB is not free (and a Pi 3 has no CPU to spare):
+            if has_wait and self.adaptive_poll:         # polling the DAC over USB is not free (and a Pi 3 has no CPU to spare):
                 eta = busy_until - last_dur - time.monotonic() - 0.004
                 if eta > 0:                             # sleep until shortly before it can want a frame, then poll finely
                     self._stop.wait(min(eta, 0.1))
             try:
                 if has_wait:
                     if has_poll:
-                        dac.wait_ready(1.0, poll_s=0.001)   # ready -> only now choose WHICH frame to send
+                        dac.wait_ready(1.0, poll_s=0.001 if self.adaptive_poll else 0.0005)   # ready -> only now choose WHICH frame
                     else:
                         dac.wait_ready(1.0)
             except Exception as e:
-                if not survive(e):
+                if not survive(e, "waiting for the DAC (GetStatus)"):
                     self._fail(str(e))
                 continue
             with self._mb_lock:
@@ -374,13 +411,16 @@ class LaserEngine:
                 else:
                     dac.write(pts, self.pps)            # (test doubles: write itself blocks for pacing)
             except Exception as e:
-                if not survive(e):
+                if not survive(e, "sending a frame (WriteFrame)"):
                     self._fail(str(e))
                 continue
             now2 = time.monotonic()
+            last_write_t = now2
             last_dur = len(pts) / float(self.pps)
             busy_until = max(now2, busy_until) + last_dur
-            err_since, dark, last_sent = 0.0, False, seq
+            if run_n:
+                note(f"USB recovered after {run_n} error(s), {1000 * (now2 - err_since):.0f} ms")
+            err_since, run_n, dark, last_sent = 0.0, 0, False, seq
             self._taken.set()
             with self._lock:
                 self._s["sent"] += 1

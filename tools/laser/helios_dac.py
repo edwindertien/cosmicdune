@@ -60,8 +60,16 @@ class NoDeviceError(HeliosError):
 _TRANSIENT_LIBUSB = {-1: "I/O error", -6: "busy", -7: "timeout", -8: "overflow", -9: "pipe error", -10: "interrupted"}
 
 
+# The SDK itself also folds some transfer failures into its OWN codes (the libusb reason is hidden): -1001 "previous frame
+# still transferring", -1002 "USB control transfer failed", -1003 "device reported an error". Seen on a Raspberry Pi 4 where
+# the same kind of fault shows up this way instead of as a libusb timeout. Same treatment: retry, give up if it persists.
+# (-1000 "device closed / unplugged" and the argument errors are NOT transient.)
+_TRANSIENT_SDK = {-1001, -1002, -1003}
+
+
 class HeliosUsbError(HeliosError):
-    """A failed USB transfer. .code is the libusb code (e.g. -7 = timeout); .transient says whether retrying makes sense."""
+    """A failed USB transfer. .code is the libusb code (e.g. -7 = timeout) or the SDK code (e.g. -1002);
+    .transient says whether retrying makes sense."""
 
     def __init__(self, message: str, code: int, transient: bool) -> None:
         super().__init__(message)
@@ -70,10 +78,12 @@ class HeliosUsbError(HeliosError):
 
 def usb_error(what: str, rc: int) -> HeliosError:
     """Build the right exception for a negative SDK return value."""
-    msg = f"{what}: {describe_error(rc)} ({rc})" if what.startswith("WriteFrame") else f"{what}: {describe_error(rc)}"
+    msg = f"{what}: {describe_error(rc)} ({rc})" if (what.startswith("WriteFrame") or rc > -5000) else f"{what}: {describe_error(rc)}"
     if rc <= -5000:
         lib = rc + 5000
         return HeliosUsbError(msg, lib, lib in _TRANSIENT_LIBUSB)
+    if rc in _TRANSIENT_SDK:
+        return HeliosUsbError(msg, rc, True)
     return HeliosError(msg)
 
 

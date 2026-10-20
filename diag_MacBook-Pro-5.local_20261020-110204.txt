@@ -1,0 +1,106 @@
+cosmic dune -- USB diagnostics
+============================================================
+
+SUMMARY (paste just this block if you prefer; the full file has the details)
+  polling   USB errors  per minute   load  frames/s  re-sent   verdict
+  adaptive           0         0.0    7 %      35.3    0.0 %   VERDICT: keeps up
+  fast               7         7.0   16 %      35.0    0.0 %   VERDICT: keeps up
+  error kinds:
+  [fast] 5 x GetStatus: libusb error -7
+  [fast] 2 x GetStatus: USB control transfer failed (-1002)
+
+============================================================
+SYSTEM
+============================================================
+date                    2026-10-20 10:59:59 +0200
+host                    MacBook-Pro-5.local
+platform                macOS-15.7.3-arm64-arm-64bit
+python                  3.11.7
+usb autosuspend         (n/a)
+libusb package          (not available: dpkg-query)
+
+-- lsusb -t (the USB tree; the speed of the DAC's link is at the end of its line: 12M = full speed) --
+Usage: lsusb [options]...
+List USB devices
+  -v, --verbose
+      Increase verbosity (show descriptors)
+  -s [[bus]:][devnum]
+      Show only devices with specified device and/or
+      bus numbers (in decimal)
+  -d vendor:[product]
+      Show only devices with the specified vendor and
+      product ID numbers (in hexadecimal)
+  -D device
+      Selects which device lsusb will examine
+  -V, --version
+      Show version of program
+  -h, --help
+      Show usage and help
+-- lsusb -d 1209:e500 (the Helios) --
+Bus 002 Device 008: ID 1209:e500
+
+============================================================
+BENCH, DAC polling adaptive  (exit code 0)
+============================================================
+bench: scene converge, six simulated pods, 60 s measured, pps 20000, frame 30 ms
+       output is DARK: colours are forced to zero, the mirrors move but nothing is emitted.
+       DAC polling: adaptive
+machine: Darwin arm64, Python 3.11.7, 10 cores, load avg 6.2/24.2/15.7
+DAC    : Helios 842149943  (/Users/Dertien/git/cosmicdune/tools/laser/lib/libHeliosLaserDAC.dylib)
+
+frame period            28.6 ms   (572 points)
+building one frame       2.1 ms avg     2.2 ms worst   -> load 7 % of the period
+frames built / s        35.3
+frames sent / s         35.3    re-sent because none was ready: 0 (0.0 %)    dark events: 0
+USB (per frame)       waiting for ready  24.0 ms avg (8 polls), WriteFrame  4.0 ms avg / 4.3 ms worst
+USB errors survived        0      = 0.0 per minute
+this process' CPU         11 %  of one core (all threads together)
+
+VERDICT: keeps up. Frames reach the DAC on time; the laser would stay lit with a smooth animation.
+-- libusb's own log (LIBUSB_DEBUG=2): 2 line(s), grouped --
+      1 x libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+      1 x libusb: warning [darwin_transfer_status] transfer error: timed out
+
+============================================================
+BENCH, DAC polling fast  (exit code 0)
+============================================================
+bench: scene converge, six simulated pods, 60 s measured, pps 20000, frame 30 ms
+       output is DARK: colours are forced to zero, the mirrors move but nothing is emitted.
+       DAC polling: fast
+machine: Darwin arm64, Python 3.11.7, 10 cores, load avg 2.4/19.5/14.5
+DAC    : Helios 842149943  (/Users/Dertien/git/cosmicdune/tools/laser/lib/libHeliosLaserDAC.dylib)
+
+frame period            28.2 ms   (565 points)
+building one frame       4.5 ms avg    43.0 ms worst   -> load 16 % of the period
+frames built / s        35.0
+frames sent / s         35.0    re-sent because none was ready: 1 (0.0 %)    dark events: 0
+USB (per frame)       waiting for ready  22.5 ms avg (7 polls), WriteFrame  4.8 ms avg / 39.7 ms worst
+USB errors survived        7      = 7.0 per minute      last: GetStatus failed: libusb error -7
+          5 x GetStatus: libusb error -7
+          2 x GetStatus: USB control transfer failed (-1002)
+      11:01:58.058 USB error #1 while waiting for the DAC (GetStatus): GetStatus failed: USB control transfer failed (-1002)  (52 ms after the last frame; 1st in a row)
+      11:01:58.078 USB recovered after 1 error(s), 20 ms
+      11:01:59.485 USB error #2 while waiting for the DAC (GetStatus): GetStatus failed: libusb error -7  (35 ms after the last frame; 1st in a row)
+      11:01:59.630 USB error #3 while waiting for the DAC (GetStatus): GetStatus failed: libusb error -7  (180 ms after the last frame; 2nd in a row)
+      11:01:59.684 USB recovered after 2 error(s), 199 ms
+      11:01:59.733 USB error #4 while waiting for the DAC (GetStatus): GetStatus failed: USB control transfer failed (-1002)  (48 ms after the last frame; 1st in a row)
+         ... (events in between left out) ...
+      11:02:00.432 USB error #5 while waiting for the DAC (GetStatus): GetStatus failed: libusb error -7  (48 ms after the last frame; 1st in a row)
+      11:02:00.444 USB recovered after 1 error(s), 13 ms
+      11:02:02.296 USB error #6 while waiting for the DAC (GetStatus): GetStatus failed: libusb error -7  (56 ms after the last frame; 1st in a row)
+      11:02:02.317 USB recovered after 1 error(s), 22 ms
+      11:02:02.783 USB error #7 while waiting for the DAC (GetStatus): GetStatus failed: libusb error -7  (67 ms after the last frame; 1st in a row)
+      11:02:02.800 USB recovered after 1 error(s), 17 ms
+this process' CPU         13 %  of one core (all threads together)
+
+NOTE: 7 transient USB error(s) occurred and were ridden out (GetStatus failed: libusb error -7). A few are normal under load; many mean the USB path or the CPU is struggling.
+VERDICT: keeps up. Frames reach the DAC on time; the laser would stay lit with a smooth animation.
+-- libusb's own log (LIBUSB_DEBUG=2): 16 line(s), grouped --
+      8 x libusb: warning [darwin_transfer_status] transfer error: timed out
+      6 x libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+      2 x libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 2
+
+============================================================
+KERNEL LOG (usb / xhci / under-voltage lines)
+============================================================
+(no usb/xhci/under-voltage lines in the kernel log)
