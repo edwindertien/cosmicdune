@@ -90,6 +90,10 @@ class LaserEngine:
         self._usb_events: collections.deque = collections.deque(maxlen=50)    # the LAST events
         self._usb_first: List[str] = []                                       # the FIRST events (how the trouble started)
         self._usb_kinds: collections.Counter = collections.Counter()          # error text -> how often
+        self._usb_first_t = 0.0                                               # monotonic time of the first USB error
+        self._usb_runs = 0                                                    # runs of consecutive errors that ended (recovered)
+        self._usb_longest_ms = 0.0                                            # the longest such run
+        self._usb_run_start = 0.0                                             # start of a run that is still going on (0 = none)
         self.dac_ok = dac is not None
         self._mb_lock = threading.Lock()
         self._mb: Tuple[int, Optional[List], float] = (0, None, 0.0)   # newest frame for the writer: (seq, points, built at)
@@ -199,6 +203,9 @@ class LaserEngine:
             "max_stale_ms": int(self.max_stale_s * 1000), "usb": self._usb_stats(),
             "usb_errors": s["usb_errors"], "last_usb_error": s["last_usb_error"], "viz_ms": self._viz_ms(s["load"]),
             "stages": self._stages(), "usb_events": list(self._usb_events)[-6:], "adaptive_poll": self.adaptive_poll,
+            "usb_first_error_s": (round(self._usb_first_t - arm_time, 2) if (self._usb_first_t and arm_time) else None),
+            "usb_runs": self._usb_runs,
+            "usb_longest_run_ms": round(max(self._usb_longest_ms, 1000.0 * (now - self._usb_run_start) if self._usb_run_start else 0.0)),
             "usb_kinds": dict(self._usb_kinds.most_common(6)),
             "armed_for_s": round(now - arm_time, 1) if c["armed"] else None,
             "auto_disarm_in_s": round(remaining, 1) if remaining is not None else None,
@@ -322,6 +329,7 @@ class LaserEngine:
         err_since = 0.0                                 # start of the current run of transient USB errors (0 = none)
         run_n = 0                                       # errors in the current run
         last_write_t = 0.0                              # when the last frame was handed over successfully
+        last_n = 0                                      # how many points that frame had
 
         def note(text: str) -> None:
             line = f"{time.strftime('%H:%M:%S')}.{int(time.time() * 1000) % 1000:03d} {text}"
@@ -334,24 +342,30 @@ class LaserEngine:
                 except Exception:
                     pass
 
-        def survive(e: Exception, stage: str) -> bool:
+        def survive(e: Exception, stage: str, n_pts: int = 0) -> bool:
             """A transient USB error (timeout, busy, interrupted ...) is ridden out for usb_grace_s: count it, back off,
             try again with the next frame. Anything else, or a run that lasts too long, is a real failure."""
             nonlocal err_since, busy_until, run_n
             now = time.monotonic()
             gap = f"{1000 * (now - last_write_t):.0f} ms after the last frame" if last_write_t else "before the first frame"
+            n_pts = n_pts or last_n
+            if n_pts:                                   # (n - 45) % 64 == 0 is the frame size the SDK has to work around (USB packet boundary)
+                gap += f"; frame {n_pts} pts" + (" [= 45 mod 64]" if (n_pts - 45) % 64 == 0 else "")
             if not getattr(e, "transient", False):
                 note(f"USB FATAL while {stage}: {e}  ({gap})")
                 self._usb_kinds[f"FATAL {'GetStatus' if 'GetStatus' in stage else 'WriteFrame'}: {str(e).split(': ', 1)[-1]}"] += 1
                 return False
             err_since = err_since or now
+            if not self._usb_first_t:
+                self._usb_first_t = now
+            self._usb_run_start = self._usb_run_start or now
             run_n += 1
             with self._lock:
                 self._s["usb_errors"] += 1
                 self._s["last_usb_error"] = str(e)
                 total = self._s["usb_errors"]
             self._usb_kinds[f"{'GetStatus' if 'GetStatus' in stage else 'WriteFrame'}: {str(e).split(': ', 1)[-1]}"] += 1
-            note(f"USB error #{total} while {stage}: {e}  ({gap}; {run_n}{'st' if run_n == 1 else 'nd' if run_n == 2 else 'rd' if run_n == 3 else 'th'} in a row)")
+            note(f"USB error #{total} while {stage}: {e}  ({gap}; {run_n}{'th' if 10 <= run_n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(run_n % 10, 'th')} in a row)")
             if now - err_since > self.usb_grace_s:
                 note(f"USB errors lasted over {self.usb_grace_s:g} s: giving up")
                 return False
@@ -383,7 +397,7 @@ class LaserEngine:
                     else:
                         dac.wait_ready(1.0)
             except Exception as e:
-                if not survive(e, "waiting for the DAC (GetStatus)"):
+                if not survive(e, "waiting for the DAC (GetStatus)", last_n):
                     self._fail(str(e))
                 continue
             with self._mb_lock:
@@ -411,15 +425,19 @@ class LaserEngine:
                 else:
                     dac.write(pts, self.pps)            # (test doubles: write itself blocks for pacing)
             except Exception as e:
-                if not survive(e, "sending a frame (WriteFrame)"):
+                if not survive(e, "sending a frame (WriteFrame)", len(pts)):
                     self._fail(str(e))
                 continue
             now2 = time.monotonic()
             last_write_t = now2
+            last_n = len(pts)
             last_dur = len(pts) / float(self.pps)
             busy_until = max(now2, busy_until) + last_dur
             if run_n:
                 note(f"USB recovered after {run_n} error(s), {1000 * (now2 - err_since):.0f} ms")
+                self._usb_runs += 1
+                self._usb_longest_ms = max(self._usb_longest_ms, 1000.0 * (now2 - err_since))
+                self._usb_run_start = 0.0
             err_since, run_n, dark, last_sent = 0.0, 0, False, seq
             self._taken.set()
             with self._lock:

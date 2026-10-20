@@ -142,15 +142,17 @@ class HeliosDAC:
         self._t_ready = collections.deque(maxlen=120)
         self._t_polls = collections.deque(maxlen=120)
         self._t_write = collections.deque(maxlen=120)
+        self._t_poll = collections.deque(maxlen=600)      # duration of each single GetStatus call
 
     def stats(self) -> dict:
         """Averages/maxima (ms) over the last <=120 frames; all zeros before the first frame."""
-        ready, polls, write = tuple(self._t_ready), tuple(self._t_polls), tuple(self._t_write)   # snapshots: the writer appends meanwhile
+        ready, polls, write, poll1 = tuple(self._t_ready), tuple(self._t_polls), tuple(self._t_write), tuple(self._t_poll)   # snapshots: the writer appends meanwhile
         def avg(d): return 1000.0 * sum(d) / len(d) if d else 0.0
         def mx(d): return 1000.0 * max(d) if d else 0.0
         return {"ready_ms": avg(ready), "ready_max_ms": mx(ready),
                 "polls": (sum(polls) / len(polls)) if polls else 0.0,
-                "write_ms": avg(write), "write_max_ms": mx(write)}
+                "write_ms": avg(write), "write_max_ms": mx(write),
+                "poll_ms": avg(poll1), "poll_max_ms": mx(poll1)}
 
     # -- lifecycle ----------------------------------------------------------
     def open(self) -> "HeliosDAC":
@@ -265,9 +267,20 @@ class HeliosDAC:
         if rc != 1:
             raise usb_error("WriteFrame failed", rc)
 
-    def wait_ready(self, timeout: float = 1.0, poll_s: float = 0.0005) -> None:
-        """Block until the DAC can take another frame. Separate from write() so a caller can choose WHICH frame
-        to send at the last moment (the newest one) instead of committing to one before waiting."""
+    def status_raw(self) -> int:
+        """ONE GetStatus call; returns the SDK's raw result (1 ready, 0 busy, negative = an error) and never raises on a
+        failed transfer. For diagnostics: idle-polling tests that must not stop at the first error."""
+        if not self._opened or self._closed:
+            raise HeliosError("DAC is not open")
+        tp = time.perf_counter()
+        st = self._lib.GetStatus(self.device)
+        self._t_poll.append(time.perf_counter() - tp)
+        return st
+
+    def wait_ready(self, timeout: float = 1.0, poll_s: float = 0.0005) -> int:
+        """Block until the DAC can take another frame; returns how many status polls that took. Separate from write()
+        so a caller can choose WHICH frame to send at the last moment (the newest one) instead of committing to one
+        before waiting."""
         if not self._opened or self._closed:
             raise HeliosError("DAC is not open")
         t0 = time.perf_counter()
@@ -275,7 +288,9 @@ class HeliosDAC:
         polls = 0
         while True:
             polls += 1
+            tp = time.perf_counter()
             st = self._lib.GetStatus(self.device)
+            self._t_poll.append(time.perf_counter() - tp)
             if st == 1:
                 break
             if st < 0:
@@ -285,6 +300,7 @@ class HeliosDAC:
             time.sleep(poll_s)
         self._t_ready.append(time.perf_counter() - t0)
         self._t_polls.append(polls)
+        return polls
 
 
 class DummyDAC:

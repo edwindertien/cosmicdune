@@ -101,6 +101,7 @@ from typing import Dict, List, Optional
 
 import patterns as P
 import visuals as V
+import helios_dac as HD
 from helios_dac import DummyDAC, HeliosDAC, HeliosError
 
 EXIT_USAGE, EXIT_DEVICE, EXIT_UNSAFE = 2, 3, 4
@@ -633,6 +634,67 @@ def cmd_cycle(args) -> int:
     return session(args, names, args.each)
 
 
+def cmd_usbtest(args) -> int:
+    """IDLE polling: ask the DAC 'ready?' in a loop with NO frames at all (output dark). If this fails, frames, polling modes and the
+    engine are irrelevant: it is the USB path to the DAC (cable, port, hub, SDK build) or the DAC itself."""
+    import collections
+    dac = open_dac(args)
+    kinds: "collections.Counter[str]" = collections.Counter()
+    events: List[str] = []
+    polls = errs = run = longest_polls = 0
+    worst = total = 0.0
+    first_err = run_t0 = None
+    longest_ms = 0.0
+    try:
+        print(f"DAC    : {dac.name or '(unnamed)'}  firmware {dac.firmware}  ({dac.lib_path})")
+        if args.dry_run:
+            print("idle polling: (dry run: no DAC to poll)")
+            return 0
+        t0 = time.monotonic()
+        end = t0 + args.seconds
+        while time.monotonic() < end:
+            tp = time.perf_counter()
+            st = dac.status_raw()
+            dt = time.perf_counter() - tp
+            polls += 1
+            total += dt
+            worst = max(worst, dt)
+            now = time.monotonic()
+            if st < 0:
+                errs += 1
+                run += 1
+                run_t0 = run_t0 or now
+                first_err = first_err if first_err is not None else now - t0
+                kind = str(HD.usb_error("GetStatus failed", st)).split(": ", 1)[-1]
+                kinds[kind] += 1
+                events.append(f"{now - t0:7.3f} s  {kind}  (poll took {1000 * dt:.1f} ms; {run} in a row)")
+            elif run:
+                longest_polls = max(longest_polls, run)
+                longest_ms = max(longest_ms, 1000 * (now - run_t0))
+                run, run_t0 = 0, None
+            time.sleep(max(0.0, args.interval_ms / 1000.0))
+        if run:
+            longest_polls = max(longest_polls, run)
+            longest_ms = max(longest_ms, 1000 * (time.monotonic() - run_t0))
+    finally:
+        dac.close()
+    wall = max(time.monotonic() - t0, 0.001)
+    print(f"idle polling, every {args.interval_ms:g} ms for {wall:.0f} s: {polls} polls, {errs} errors ({60.0 * errs / wall:.1f} per minute); "
+          f"one poll {1000 * total / max(1, polls):.1f} ms avg / {1000 * worst:.1f} worst; "
+          f"first error {('%.1f s in' % first_err) if first_err is not None else 'none'}; longest run {longest_polls} polls / {longest_ms:.0f} ms")
+    for k, n in kinds.most_common():
+        print(f"      {n:5d} x {k}")
+    if len(events) > 12:
+        events = events[:6] + ["   ... (left out) ..."] + events[-6:]
+    for e in events:
+        print(f"      {e}")
+    if errs == 0:
+        print("RESULT: idle polling is CLEAN: the DAC answers every status request when no frames are involved.")
+    else:
+        print("RESULT: idle polling FAILS even with no frames at all: this is the USB path or the DAC, not frames or polling modes.")
+    return 0 if errs == 0 else EXIT_DEVICE
+
+
 def _machine_line() -> str:
     import platform
     parts = [f"{platform.system()} {platform.machine()}", f"Python {platform.python_version()}", f"{os.cpu_count()} cores"]
@@ -666,7 +728,8 @@ def cmd_bench(args) -> int:
     eng = E.LaserEngine(lambda: {}, view, cal, args.pps, args.frame_ms, P.PALETTES[args.palette], dac=dac, source="demo",
                         scene=args.scene, sync=args.sync if args.sync is not None else 0.5, sync_mode="hold",
                         max_intensity=0.0,                  # the engine clamps every colour to 0: the beam cannot light
-                        auto_disarm_s=0, min_extent=args.min_extent, adaptive_poll=args.usb_polling == "adaptive")
+                        auto_disarm_s=0, min_extent=args.min_extent, adaptive_poll=args.usb_polling == "adaptive",
+                        usb_grace_s=3600.0)              # transient USB errors never latch here: a persistent failure is MEASURED, not cut short
     try:
         print(f"bench: scene {args.scene}, six simulated pods, {args.seconds:g} s measured, pps {args.pps}, frame {args.frame_ms:g} ms")
         print("       output is DARK: colours are forced to zero, the mirrors move but nothing is emitted.")
@@ -682,51 +745,72 @@ def cmd_bench(args) -> int:
         time.sleep(2.0)                                     # warm-up: caches, first USB transfers
         s0, c0, w0 = eng.state(), time.process_time(), time.monotonic()
         end = w0 + args.seconds
+        failed = ""
         while time.monotonic() < end:
             time.sleep(0.25)
             st = eng.state()
             if st["mode"] == "error":
-                print(f"\nDAC error during the run: {st['error']}", file=sys.stderr)
-                return EXIT_DEVICE
+                failed = st["error"]                        # a FATAL error latched: stop here, but still report everything we know
+                break
             if any(st["peak_rgb"]):
                 print("\nABORT: a frame carried colour although the bench forces zero. Nothing was emitted by design, but stopping.", file=sys.stderr)
                 return EXIT_UNSAFE
         s1, c1, w1 = eng.state(), time.process_time(), time.monotonic()
     finally:
         eng.shutdown()                                      # Stop + shutter closed + close
-    wall = w1 - w0
+    wall = max(w1 - w0, 0.001)
     built, sent = s1["frames"] - s0["frames"], s1["sent"] - s0["sent"]
     late, dark = s1["late"] - s0["late"], s1["dark"] - s0["dark"]
-    if built <= 0 or sent <= 0:                             # never call that "keeps up": nothing was measured
+    if built <= 0:                                          # never call that "keeps up": nothing was measured
         print()
-        print(f"FAILED: {'the engine produced NO frames' if built <= 0 else 'frames were built but none reached the DAC'} "
-              f"in {wall:.0f} s (built {built}, sent {sent}, refused {s1['refused']}).")
+        print(f"FAILED: the engine produced NO frames in {wall:.0f} s (built {built}, sent {sent}, refused {s1['refused']}).")
         print(f"        last problem: {s1['last_refusal'] or '(none recorded)'}")
         print("        This is not a speed result. Check that every file of the laser/ folder is from the same update.")
         return EXIT_DEVICE
     period = s1["frame_ms"]
     usb = s1.get("usb") or {}
+    expected = wall * 1000.0 / period if period > 0 else 0.0
+    usb_total, usb_warm = s1["usb_errors"], s0["usb_errors"]
+    usb_win = usb_total - usb_warm
     print()
     print(f"frame period          {period:6.1f} ms   ({s1['points']} points)")
     print(f"building one frame    {s1['build_ms']:6.1f} ms avg   {s1['build_max_ms']:5.1f} ms worst   -> load {100 * s1['load']:.0f} % of the period"
           f"{'   <-- cannot keep up' if s1['load'] >= 1.0 else ''}")
     print(f"frames built / s      {built / wall:6.1f}")
     print(f"frames sent / s       {sent / wall:6.1f}    re-sent because none was ready: {late} ({100.0 * late / max(1, sent):.1f} %)    dark events: {dark}")
+    print(f"delivered to the DAC  {100.0 * sent / max(1.0, expected):6.0f} %     of the ~{expected:.0f} frames it should have played in this window")
     if usb:
-        print(f"USB (per frame)       waiting for ready {usb['ready_ms']:5.1f} ms avg ({usb['polls']:.0f} polls), "
+        print(f"USB (per frame)       waiting for ready {usb['ready_ms']:5.1f} ms avg ({usb['polls']:.0f} polls; one poll "
+              f"{usb.get('poll_ms', 0):.1f} ms avg / {usb.get('poll_max_ms', 0):.1f} worst), "
               f"WriteFrame {usb['write_ms']:4.1f} ms avg / {usb['write_max_ms']:.1f} ms worst")
-    usb_err = s1["usb_errors"] - s0["usb_errors"]
-    if usb or usb_err:
-        print(f"USB errors survived   {usb_err:6d}      = {60.0 * usb_err / wall:.1f} per minute" + (f"      last: {s1['last_usb_error']}" if usb_err else ""))
+    if usb or usb_total:
+        print(f"USB errors survived   {usb_win:6d}      = {60.0 * usb_win / wall:.1f} per minute"
+              + (f"      last: {s1['last_usb_error']}" if usb_total else "")
+              + (f"      (plus {usb_warm} during the 2 s warm-up)" if usb_warm else ""))
+        if s1["usb_first_error_s"] is not None:
+            print(f"first USB error       {s1['usb_first_error_s']:6.1f} s after arming")
+        if usb_total:
+            print(f"error runs            {s1['usb_runs']} ended; longest {s1['usb_longest_run_ms']} ms  (a run = errors in a row until a call succeeded)")
         for kind, n in sorted(s1["usb_kinds"].items(), key=lambda kv: -kv[1]):
             print(f"      {n:5d} x {kind}")
-        for ev in (eng.usb_events_all(args.events) if usb_err else []):
+        for ev in (eng.usb_events_all(args.events) if usb_total else []):
             print(f"      {ev}")
     print(f"this process' CPU     {100.0 * (c1 - c0) / wall:6.0f} %  of one core (all threads together)")
     print()
+    delivered = sent / max(1.0, expected)
+    if failed:
+        print(f"STOPPED EARLY: a fatal DAC error latched after {time.monotonic() - w0:.1f} s of the window: {failed}")
+    if sent <= 0:
+        print(f"FAILED: frames were built but NONE reached the DAC in {wall:.0f} s (built {built}, sent {sent}).")
+        print("        This is not a speed result: the USB path to the DAC is not working at all.")
+        return EXIT_DEVICE
+    if failed or delivered < 0.8 or s1["usb_longest_run_ms"] > 500:
+        print(f"VERDICT: the USB path is UNRELIABLE -- {100 * delivered:.0f} % of the frames got through, longest run of errors {s1['usb_longest_run_ms']} ms. "
+              "This is not a speed result.")
+        return EXIT_DEVICE
     repeat_pct = 100.0 * late / max(1, sent)
-    if usb_err:
-        print(f"NOTE: {usb_err} transient USB error(s) occurred and were ridden out ({s1['last_usb_error']}). "
+    if usb_win:
+        print(f"NOTE: {usb_win} transient USB error(s) occurred and were ridden out ({s1['last_usb_error']}). "
               "A few are normal under load; many mean the USB path or the CPU is struggling.")
     if dark == 0 and repeat_pct < 2.0:
         print("VERDICT: keeps up. Frames reach the DAC on time; the laser would stay lit with a smooth animation.")
@@ -784,7 +868,7 @@ def _decode_throttled(text: str) -> str:
     return f"0x{v:x}  " + ("(clean)" if not hits else "; ".join(hits))
 
 
-def _diag_system() -> List[str]:
+def _diag_system(usb_root: str = "/sys/bus/usb/devices") -> List[str]:
     import glob
     import platform
     import socket
@@ -810,17 +894,56 @@ def _diag_system() -> List[str]:
         add("temperature", _run_text(["vcgencmd", "measure_temp"], limit=1))
         add("core voltage", _run_text(["vcgencmd", "measure_volts", "core"], limit=1))
     add("usb autosuspend", _read("/sys/module/usbcore/parameters/autosuspend") or "(n/a)")
-    for dev in sorted(glob.glob("/sys/bus/usb/devices/*")):
+    for dev in sorted(glob.glob(usb_root + "/*")):
         if _read(f"{dev}/idVendor") == "1209" and _read(f"{dev}/idProduct") == "e500":
             add("Helios USB device", os.path.basename(dev))
             for key in ("speed", "bMaxPower", "version", "power/control", "power/autosuspend_delay_ms", "power/runtime_status"):
                 add(f"   {key}", _read(f"{dev}/{key}") or "(n/a)")
+            parent = os.path.dirname(os.path.realpath(dev))
+            proto = {"00": "full-speed hub", "01": "high-speed hub, ONE transaction translator shared by all its full/low-speed devices",
+                     "02": "high-speed hub, one translator PER PORT"}.get(_read(f"{parent}/bDeviceProtocol"), "")
+            add("parent (hub) of the DAC", f"{os.path.basename(parent)}: {_read(f'{parent}/product') or '?'} [{_read(f'{parent}/idVendor')}:{_read(f'{parent}/idProduct')}], "
+                f"{_read(f'{parent}/speed')} Mbit/s, {_read(f'{parent}/maxchild') or '?'} ports" + (f"; {proto}" if _read(f"{parent}/bDeviceClass") == "09" and proto else ""))
+            import re as _re
+            for sub in sorted(glob.glob(parent + "/*")):
+                nm = os.path.basename(sub)
+                if _re.fullmatch(r"\d+-[\d.]+", nm) and os.path.realpath(sub) != os.path.realpath(dev):
+                    add(f"   shares that hub: {nm}", f"{_read(f'{sub}/product') or '?'}, {_read(f'{sub}/speed')} Mbit/s")
     add("libusb package", _run_text(["dpkg-query", "-W", "libusb-1.0-0"], limit=1))
     L.append("")
     L.append("-- lsusb -t (the USB tree; the speed of the DAC's link is at the end of its line: 12M = full speed) --")
-    L.append(_run_text(["lsusb", "-t"], limit=30))
+    tree = _run_text(["lsusb", "-t"], limit=30)
+    L.append("(this lsusb has no -t; on the Pi it prints the tree)" if tree.lstrip().startswith("Usage") else tree)
     L.append("-- lsusb -d 1209:e500 (the Helios) --")
     L.append(_run_text(["lsusb", "-d", "1209:e500"], limit=3))
+    if platform.system() == "Darwin":                       # macOS: the Helios block of the system profiler (speed, power)
+        prof = _run_text(["system_profiler", "SPUSBDataType"], timeout=20, limit=4000).splitlines()
+        hit = next((i for i, l in enumerate(prof) if "0x1209" in l), None)
+        L.append("-- system_profiler, the Helios entry --")
+        L.append("\n".join(prof[max(0, hit - 10):hit + 10]) if hit is not None else "(Helios not found in the profile)")
+    return L
+
+
+def _diag_sdk(args) -> List[str]:
+    """Which Helios SDK build is this, and which libusb does it use? (The Mac's prebuilt dylib and a library built on the Pi are different builds.)"""
+    import hashlib
+    import platform
+    L: List[str] = []
+    try:
+        path = HD.find_library(args.lib)
+    except Exception as e:
+        return [f"{'Helios library':<24}(not found: {e})"]
+    try:
+        data = open(path, "rb").read()
+        st = os.stat(path)
+        marks = {m.decode(): (m in data) for m in (b"Found new USB Helios DAC", b"Unknown Helios", b"Closing Helios USB DAC")}
+        L.append(f"{'Helios library':<24}{path}")
+        L.append(f"{'   file':<24}{st.st_size} bytes, modified {time.strftime('%Y-%m-%d %H:%M', time.localtime(st.st_mtime))}, sha256 {hashlib.sha256(data).hexdigest()[:12]}")
+        L.append(f"{'   prints (SDK text)':<24}" + ", ".join(f"'{k}': {'yes' if v else 'no'}" for k, v in marks.items()))
+        link = _run_text(["otool", "-L", path] if platform.system() == "Darwin" else ["ldd", path], limit=30)
+        L.append(f"{'   links usb':<24}" + ("; ".join(l.strip() for l in link.splitlines() if "usb" in l.lower()) or "(no libusb line: statically linked or n/a)"))
+    except OSError as e:
+        L.append(f"{'Helios library':<24}{path} (unreadable: {e})")
     return L
 
 
@@ -835,14 +958,18 @@ def _kernel_usb_lines() -> str:
     return "(kernel log not readable as this user: run   sudo dmesg --ctime | grep -i -E 'usb|xhci|volt' | tail -30   and attach that too)"
 
 
-def _group_libusb(stderr: str, limit: int = 12):
-    """libusb's own log lines grouped: the same message 900 times becomes one line with a count."""
+def _group_libusb(stderr: str, limit: int = 12, only_informative: bool = False):
+    """libusb's own log lines grouped: the same message 900 times becomes one line with a count. At debug level (3/4) libusb logs every
+    transfer; then only lines about statuses/errors/stalls/timeouts/removal are kept (that is where -71, -32, -110 ... show up)."""
     import collections
     import re
+    keep = re.compile(r"status|error|stall|overflow|remov|timeout|timed out|cancel|disconnect|discard|fail|warn|bus error|babble|crc", re.I)
     counts: "collections.Counter[str]" = collections.Counter()
     other: List[str] = []
-    for ln in stderr.splitlines():
+    for ln in stderr.splitlines()[:400000]:
         if "libusb:" in ln:
+            if only_informative and not keep.search(ln):
+                continue
             msg = re.sub(r"^\s*\[\s*[\d.]+\]\s*\[[0-9a-fA-F]+\]\s*", "", ln)
             msg = re.sub(r"0x[0-9a-fA-F]+", "0x..", msg)
             msg = re.sub(r"\b\d{3,}\b", "N", msg)
@@ -852,10 +979,23 @@ def _group_libusb(stderr: str, limit: int = 12):
     return counts.most_common(limit), sum(counts.values()), other[:15]
 
 
-def _diag_bench(args, mode: str):
+def _diag_sub(args, sub_args: List[str], timeout: float):
     import subprocess
-    cmd = [sys.executable, os.path.abspath(__file__), "bench", args.scene, "--seconds", str(args.seconds), "--usb-polling", mode,
-           "--events", "12", "--pps", str(args.pps), "--frame-ms", str(args.frame_ms), "--size", str(args.size), "--device", str(args.device)]
+    cmd = [sys.executable, os.path.abspath(__file__)] + sub_args + (["--dry-run"] if args.dry_run else []) + (["--lib", args.lib] if args.lib else []) + ["--device", str(args.device)]
+    env = dict(os.environ)
+    if args.libusb_debug:
+        env["LIBUSB_DEBUG"] = str(args.libusb_debug)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        return r.stdout, r.stderr, r.returncode
+    except subprocess.TimeoutExpired:
+        return "", "did not finish in time", -1
+
+
+def _diag_bench(args, mode: str, seconds: float):
+    import subprocess
+    cmd = [sys.executable, os.path.abspath(__file__), "bench", args.scene, "--seconds", str(seconds), "--usb-polling", mode,
+           "--events", "8", "--pps", str(args.pps), "--frame-ms", str(args.frame_ms), "--size", str(args.size), "--device", str(args.device)]
     if args.dry_run:
         cmd.append("--dry-run")
     if args.lib:
@@ -864,7 +1004,7 @@ def _diag_bench(args, mode: str):
     if args.libusb_debug:
         env["LIBUSB_DEBUG"] = str(args.libusb_debug)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=args.seconds + 90, env=env)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=seconds + 90, env=env)
         return r.stdout, r.stderr, r.returncode
     except subprocess.TimeoutExpired:
         return "", "the bench did not finish in time", -1
@@ -874,54 +1014,135 @@ def _bench_facts(out: str) -> dict:
     import re
     g = lambda pat, cast=float: (cast(m.group(1)) if (m := re.search(pat, out)) else None)
     verdict = re.search(r"^(VERDICT.*|FAILED.*)$", out, re.M)
-    return {"errors": g(r"USB errors survived\s+(\d+)", int), "per_min": g(r"= ([\d.]+) per minute"), "load": g(r"-> load (\d+) %", int),
+    pm = re.search(r"waiting for ready\s+([\d.]+) ms avg \((\d+) polls; one poll ([\d.]+) ms avg / ([\d.]+) worst\), WriteFrame\s+([\d.]+) ms avg / ([\d.]+) ms worst", out)
+    return {"polls": int(pm.group(2)) if pm else None, "poll_avg": float(pm.group(3)) if pm else None, "poll_max": float(pm.group(4)) if pm else None,
+            "write_max": float(pm.group(6)) if pm else None, "errors": g(r"USB errors survived\s+(\d+)", int), "per_min": g(r"= ([\d.]+) per minute"), "load": g(r"-> load (\d+) %", int),
             "sent": g(r"frames sent / s\s+([\d.]+)"), "resent": g(r"\(([\d.]+) %\)\s+dark"),
             "verdict": (verdict.group(1).split(". ")[0][:60] if verdict else "(no verdict: see the bench text)")}
 
 
+def _hub_pids() -> List[int]:
+    """PIDs of running `python ... osc_web_dashboard.py` processes (the hub). NOT a substring search: an editor, tail, grep or shell
+    that merely mentions the file name must not count."""
+    import subprocess
+    try:
+        out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return []
+    mine = {os.getpid(), os.getppid()}
+    pids = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or not parts[0].isdigit() or int(parts[0]) in mine:
+            continue
+        exe = os.path.basename(parts[1]).lower()
+        if exe.startswith("python") and any(os.path.basename(tok) == "osc_web_dashboard.py" for tok in parts[2:]):
+            pids.append(int(parts[0]))
+    return pids
+
+
 def cmd_diag(args) -> int:
-    """One command, one small file: system facts + the dark bench in both polling modes with libusb's own log -> diag_*.txt"""
+    """One command, one small file: system facts + the dark bench in both polling modes (interleaved) with libusb's log -> diag_*.txt"""
+    import collections
+    import platform
     import socket
     check_args(args)
     if args.scene not in V.SCENES:
         print(f"unknown scene {args.scene!r}; try `list`", file=sys.stderr)
         return EXIT_USAGE
     if not args.dry_run and not args.force:
-        running = _run_text(["pgrep", "-f", "osc_web_dashboard.py"], limit=5)
-        pids = [p for p in running.split() if p.isdigit() and int(p) != os.getpid()]
+        pids = _hub_pids()
         if pids:
             print("The hub (osc_web_dashboard.py) is running and holds the DAC; only one program can. Stop it first "
-                  f"(Ctrl-C, or `kill {' '.join(pids)}`), or use --force.", file=sys.stderr)
+                  f"(Ctrl-C, or `kill {' '.join(str(p) for p in pids)}`), or use --force.", file=sys.stderr)
             return EXIT_USAGE
-    print(f"diag: collecting system facts, then two dark bench runs of {args.seconds:g} s (adaptive, fast). Nothing is emitted.")
-    sections: List[str] = []
-    system = _diag_system()
-    runs = {}
-    for mode in ("adaptive", "fast"):
-        print(f"  bench, DAC polling {mode} ... ", end="", flush=True)
-        out, err, rc = _diag_bench(args, mode)
-        facts = _bench_facts(out)
-        groups, n_lines, other = _group_libusb(err)
-        runs[mode] = (out, err, rc, facts, groups, n_lines, other)
-        print(f"{facts['verdict']}  (USB errors: {facts['errors']}, {facts['per_min']} per minute)")
+    rounds = max(1, args.rounds)
+    seg = max(5.0, args.seconds / rounds)
+    print(f"diag: collecting system facts, then dark bench runs: {rounds} x (adaptive, fast) of {seg:g} s each, interleaved "
+          f"so that drift in the machine does not favour one mode. Nothing is emitted.")
+    system = _diag_system() + [""] + _diag_sdk(args)
+    import re as _re
+    probes, idles = [], []
+    for i in range(max(0, args.probes)):
+        out, err, rc = _diag_sub(args, ["probe"], 40)
+        m = _re.search(r"DAC\s*:\s*(.*?)\s+firmware\s+(\S+)", out)
+        probes.append({"rc": rc, "name": m.group(1) if m else "(no name)", "fw": m.group(2) if m else "?", "err": (err.strip().splitlines() or [""])[-1][:110]})
+        print(f"  probe {i + 1}/{args.probes} (reads the DAC's name and firmware: control path only) ... "
+              + (f"ok  [{probes[-1]['name']}]" if rc == 0 else f"FAILED  {probes[-1]['err']}"))
+        time.sleep(1.0)
+    if args.idle_seconds > 0:
+        for ms in (3.0, 30.0):
+            print(f"  idle polling every {ms:g} ms for {args.idle_seconds:g} s, NO frames ... ", end="", flush=True)
+            out, err, rc = _diag_sub(args, ["usbtest", "--seconds", str(args.idle_seconds), "--interval-ms", str(ms)], args.idle_seconds + 60)
+            m = _re.search(r"(\d+) polls, (\d+) errors .*?one poll ([\d.]+) ms avg / ([\d.]+) worst; first error (.*?); longest run (\d+) polls / (\d+) ms", out)
+            groups, n_lines, other = _group_libusb(err, limit=40, only_informative=args.libusb_debug >= 3)
+            idles.append({"ms": ms, "out": out, "rc": rc, "m": m, "groups": groups, "n": n_lines, "err": err.strip()[-200:]})
+            print((f"{m.group(2)} errors in {m.group(1)} polls (worst poll {m.group(4)} ms)" if m else f"no result ({idles[-1]['err'] or 'rc ' + str(rc)})"))
+    runs: "dict[str, list]" = {"adaptive": [], "fast": []}
+    for r in range(rounds):
+        for mode in ("adaptive", "fast"):
+            print(f"  round {r + 1}/{rounds}, DAC polling {mode} ... ", end="", flush=True)
+            out, err, rc = _diag_bench(args, mode, seg)
+            facts = _bench_facts(out)
+            groups, n_lines, other = _group_libusb(err, limit=40, only_informative=args.libusb_debug >= 3)
+            runs[mode].append({"out": out, "rc": rc, "facts": facts, "groups": groups, "n": n_lines, "other": other})
+            print(f"{facts['verdict']}  (USB errors: {facts['errors'] if facts['errors'] is not None else '-'})")
+    num = lambda v, f="{:.1f}": (f.format(v) if v is not None else "-")
+    agg = {}
+    for mode, rs in runs.items():
+        fs = [r["facts"] for r in rs]
+        errs = sum(f["errors"] or 0 for f in fs)
+        mean = lambda k: (sum(f[k] for f in fs if f[k] is not None) / max(1, sum(1 for f in fs if f[k] is not None))) if any(f[k] is not None for f in fs) else None
+        worst = lambda k: max((f[k] for f in fs if f[k] is not None), default=None)
+        agg[mode] = {"errors": errs, "per_min": 60.0 * errs / (seg * len(rs)), "polls": mean("polls"), "poll_avg": mean("poll_avg"), "poll_max": worst("poll_max"),
+                     "write_max": worst("write_max"), "load": mean("load"), "sent": mean("sent"), "ok": sum(1 for r in rs if "keeps up" in r["facts"]["verdict"])}
     summary = ["SUMMARY (paste just this block if you prefer; the full file has the details)",
-               f"  {'polling':9} {'USB errors':>10} {'per minute':>11} {'load':>6} {'frames/s':>9} {'re-sent':>8}   verdict"]
-    for mode, (_o, _e, rc, f, _g, _n, _x) in runs.items():
-        dash = lambda v, unit="": (f"{v}{unit}" if v is not None else "-")
-        summary.append(f"  {mode:9} {dash(f['errors']):>10} {dash(f['per_min']):>11} {dash(f['load'], ' %'):>6} {dash(f['sent']):>9} {dash(f['resent'], ' %'):>8}   {f['verdict']}")
-    kinds = []
-    for mode, (out, *_r) in runs.items():
-        kinds += [f"  [{mode}] {ln.strip()}" for ln in out.splitlines() if " x " in ln and ln.strip()[0:1].isdigit()]
+               f"  {rounds} x {seg:g} s per mode, interleaved.     poll = one GetStatus call; ms",
+               f"  {'polling':9} {'USB errors':>10} {'per minute':>11} {'polls/frame':>12} {'poll avg/worst':>15} {'write worst':>12} {'load':>6} {'frames/s':>9}  keeps up"]
+    for mode, a in agg.items():
+        summary.append(f"  {mode:9} {a['errors']:>10} {a['per_min']:>11.1f} {num(a['polls'], '{:.1f}'):>12} {num(a['poll_avg']) + '/' + num(a['poll_max']):>15} "
+                       f"{num(a['write_max']):>12} {num(a['load'], '{:.0f}') + ' %':>6} {num(a['sent']):>9}  {a['ok']}/{rounds}")
+    if probes:
+        names = collections.Counter(p["name"] for p in probes)
+        summary.append(f"  probes x{len(probes)} (name + firmware, control path only): {sum(1 for p in probes if p['rc'] == 0)} ok, "
+                       f"{sum(1 for p in probes if p['rc'] != 0)} failed;  names read: " + ", ".join(f"'{n}' x{c}" for n, c in names.items()))
+    for it in idles:
+        m = it["m"]
+        summary.append(f"  idle polling, no frames, every {it['ms']:g} ms: " + (f"{m.group(2)} errors in {m.group(1)} polls, worst poll {m.group(4)} ms, longest run {m.group(7)} ms"
+                                                                            if m else "no result"))
+    kinds: "collections.Counter[str]" = collections.Counter()
+    for mode, rs in runs.items():
+        for r in rs:
+            for ln in r["out"].splitlines():
+                s = ln.strip()
+                if " x " in s and s[:1].isdigit():
+                    n, _, kind = s.partition(" x ")
+                    kinds[f"[{mode}] {kind}"] += int(n)
     if kinds:
         summary.append("  error kinds:")
-        summary += kinds[:10]
-    ths = [ln for ln in system if ln.startswith("throttled") or ln.startswith("Helios USB") or ln.startswith("   speed")]
-    summary += ["  " + ln for ln in ths]
+        summary += [f"    {n:4d} x {k}" for k, n in kinds.most_common(10)]
+    summary += ["  " + ln for ln in system if ln.startswith(("throttled", "Helios USB", "   speed", "board", "parent (hub)", "   shares that hub", "Helios library", "   prints"))]
     body: List[str] = ["cosmic dune -- USB diagnostics", "=" * 60, ""] + summary + ["", "=" * 60, "SYSTEM", "=" * 60] + system
-    for mode, (out, err, rc, f, groups, n_lines, other) in runs.items():
-        body += ["", "=" * 60, f"BENCH, DAC polling {mode}  (exit code {rc})", "=" * 60, out.strip()[:3500]]
-        body += [f"-- libusb's own log (LIBUSB_DEBUG={args.libusb_debug}): {n_lines} line(s), grouped --"]
-        body += [f"  {c:5d} x {m[:170]}" for m, c in groups] or ["  (none)"]
+    if probes or idles:
+        body += ["", "=" * 60, "PROBES and IDLE POLLING (no frames)", "=" * 60]
+        for i, p in enumerate(probes, 1):
+            body.append(f"probe {i}: exit {p['rc']}, name '{p['name']}', firmware {p['fw']}" + (f"  {p['err']}" if p["rc"] else ""))
+        for it in idles:
+            body += [f"-- idle polling every {it['ms']:g} ms --", it["out"].strip()[:1800]]
+            body += [f"   libusb log: {it['n']} line(s)"] + [f"     {c:5d} x {m[:150]}" for m, c in it["groups"][:8]]
+    for mode, rs in runs.items():
+        merged: "collections.Counter[str]" = collections.Counter()
+        for r in rs:
+            for m, c in r["groups"]:
+                merged[m] += c
+        body += ["", "=" * 60, f"BENCH, DAC polling {mode}: {len(rs)} run(s); the first run in full, then only the lines that differ", "=" * 60]
+        body += [rs[0]["out"].strip()[:3200]]
+        for i, r in enumerate(rs[1:], 2):
+            keep = [ln for ln in r["out"].splitlines() if any(k in ln for k in ("USB errors survived", "USB (per frame)", "building one frame", "frames sent", "VERDICT", "FAILED", " x ", "USB error", "USB recovered"))]
+            body += [f"-- run {i} --"] + keep[:20]
+        body += [f"-- libusb's own log over all {mode} runs (LIBUSB_DEBUG={args.libusb_debug}): {sum(merged.values())} line(s), grouped --"]
+        body += [f"  {c:5d} x {m[:170]}" for m, c in merged.most_common(12)] or ["  (none)"]
+        other = [o for r in rs for o in r["other"]][:15]
         if other:
             body += ["-- other stderr --"] + ["  " + o[:170] for o in other]
     body += ["", "=" * 60, "KERNEL LOG (usb / xhci / under-voltage lines)", "=" * 60, _kernel_usb_lines()]
@@ -934,7 +1155,10 @@ def cmd_diag(args) -> int:
     print()
     print("\n".join(summary))
     print()
-    print(f"wrote {path} ({len(text) / 1024:.1f} KB). Copy it to your Mac, e.g.   scp {os.environ.get('USER', 'pi')}@{socket.gethostname()}.local:{os.path.abspath(path)} .")
+    host = socket.gethostname()
+    print(f"wrote {path} ({len(text) / 1024:.1f} KB).")
+    if platform.system() == "Linux":
+        print(f"Copy it to your Mac, run on the Mac:   scp {os.environ.get('USER', 'pi')}@{host if '.' in host else host + '.local'}:{os.path.abspath(path)} .")
     print("then ATTACH the file in the chat (better than pasting).")
     return 0
 
@@ -991,13 +1215,22 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_args(p)
     p.set_defaults(fn=cmd_show)
 
+    p = sub.add_parser("usbtest", help="poll the DAC with NO frames at all (output dark): does the USB path alone fail?")
+    p.add_argument("--seconds", type=float, default=10.0, help="how long to poll (default 10)")
+    p.add_argument("--interval-ms", type=float, default=3.0, help="pause between polls (default 3 ms, about the streaming rate)")
+    p.add_argument("--dry-run", action="store_true", help="no DAC at all")
+    p.add_argument("--lib", help="path to the Helios library (or set $HELIOS_LIB)")
+    p.add_argument("--device", type=int, default=0, help="DAC number if several are connected")
+    p.set_defaults(fn=cmd_usbtest)
+
     p = sub.add_parser("bench", help="can this computer feed the DAC? (output stays DARK; run it on the Mac and on the Pi)")
     p.add_argument("scene", nargs="?", default="converge", help="the scene to build (default converge, the heaviest)")
     p.add_argument("--seconds", type=float, default=15.0, help="measuring time after a 2 s warm-up (default 15)")
     p.add_argument("--palette", choices=sorted(P.PALETTES), default="gsr")
     p.add_argument("--dry-run", action="store_true", help="no DAC at all: measures only the computer")
     p.add_argument("--usb-polling", choices=("adaptive", "fast"), default="adaptive",
-                   help="adaptive (default) or fast (poll every 0.5 ms like the older versions): compare the USB errors per minute")
+                   help="adaptive (default: sleeps most of the learned wait, then polls) or fast (poll continuously, like the oldest "
+                        "versions): compare the USB errors per minute")
     p.add_argument("--events", type=int, default=6, help="how many USB error lines to print (first and last; default 6)")
     p.add_argument("--lib", help="path to the Helios library (or set $HELIOS_LIB)")
     p.add_argument("--device", type=int, default=0, help="DAC number if several are connected")
@@ -1006,7 +1239,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("diag", help="collect USB diagnostics into one small file to attach to the chat (output stays DARK)")
     p.add_argument("scene", nargs="?", default="converge", help="scene used for the load (default converge)")
-    p.add_argument("--seconds", type=float, default=45.0, help="length of each of the two bench runs (default 45)")
+    p.add_argument("--seconds", type=float, default=60.0, help="measuring time PER POLLING MODE in total, split over the rounds (default 60)")
+    p.add_argument("--idle-seconds", type=float, default=10.0, help="length of each idle-polling test (no frames), run at 3 ms and 30 ms (default 10; 0 = skip)")
+    p.add_argument("--probes", type=int, default=3, help="how many times to read the DAC's name and firmware first (default 3; 0 = skip)")
+    p.add_argument("--rounds", type=int, default=2, help="how many times each mode is run, interleaved adaptive, fast, adaptive, fast ... (default 2)")
     p.add_argument("--out", help="the report file (default diag_<host>_<time>.txt in the current folder)")
     p.add_argument("--libusb-debug", type=int, default=2, choices=(0, 1, 2, 3, 4),
                    help="libusb's own log level during the runs: 2 = warnings and errors (default), 3 = more, 0 = off")
