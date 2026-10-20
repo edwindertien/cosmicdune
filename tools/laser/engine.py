@@ -75,7 +75,8 @@ class LaserEngine:
                  max_intensity: float = 0.3, max_size: float = 0.6, auto_disarm_s: float = 1200.0,
                  bpm: float = 72.0, tol_bpm: float = 10.0, demo_speed: float = 1.0,
                  min_extent: float = 0.0, max_stale_s: float = 0.2, usb_grace_s: float = 1.0, viz_fps: float = 30.0,
-                 adaptive_poll: bool = True, usb_log: Optional[Callable[[str], None]] = None) -> None:
+                 adaptive_poll: bool = True, usb_log: Optional[Callable[[str], None]] = None,
+                 poll_mode: Optional[str] = None, frame_gap_s: float = 0.0015) -> None:
         self.summary_fn, self.base_view, self.cal = summary_fn, view, cal
         self.pps, self.frame_ms, self.palette = pps, frame_ms, palette
         self.dac = dac
@@ -86,6 +87,15 @@ class LaserEngine:
         self.usb_grace_s = max(0.1, float(usb_grace_s))   # transient USB errors (timeouts...) are ridden out for this long
         self.viz_fps = max(2.0, float(viz_fps))           # the visualiser's fetch rate ceiling (it backs off when the hub is overloaded)
         self.adaptive_poll = bool(adaptive_poll)          # False = the old way: poll the DAC every 0.5 ms (more USB traffic)
+        if poll_mode is not None:
+            if poll_mode not in ("adaptive", "fast", "timed"):
+                raise ValueError(f"poll_mode must be adaptive, fast or timed, not {poll_mode!r}")
+            self.adaptive_poll = poll_mode == "adaptive"
+        # "timed" = OPEN LOOP: never ask the DAC 'ready?' while it plays. Measured on a Raspberry Pi 4: status polls during streaming
+        # (~1 in 2000) make the DAC stop answering for ~2.4 s, while 40 s of timed writes with no polling ran clean. Frames are written
+        # on a fixed schedule instead: one every (its own duration + frame_gap_s), so the DAC is idle for ~frame_gap_s between frames.
+        self.poll_mode = poll_mode or ("adaptive" if self.adaptive_poll else "fast")
+        self.frame_gap_s = max(0.0, float(frame_gap_s))
         self._usb_log = usb_log                           # called (from the writer thread) with one line per USB event
         self._usb_events: collections.deque = collections.deque(maxlen=50)    # the LAST events
         self._usb_first: List[str] = []                                       # the FIRST events (how the trouble started)
@@ -202,7 +212,7 @@ class LaserEngine:
             "build_max_ms": round(s["build_max_ms"], 1), "load": round(s["load"], 2),
             "max_stale_ms": int(self.max_stale_s * 1000), "usb": self._usb_stats(),
             "usb_errors": s["usb_errors"], "last_usb_error": s["last_usb_error"], "viz_ms": self._viz_ms(s["load"]),
-            "stages": self._stages(), "usb_events": list(self._usb_events)[-6:], "adaptive_poll": self.adaptive_poll,
+            "stages": self._stages(), "usb_events": list(self._usb_events)[-6:], "adaptive_poll": self.adaptive_poll, "poll_mode": self.poll_mode,
             "usb_first_error_s": (round(self._usb_first_t - arm_time, 2) if (self._usb_first_t and arm_time) else None),
             "usb_runs": self._usb_runs,
             "usb_longest_run_ms": round(max(self._usb_longest_ms, 1000.0 * (now - self._usb_run_start) if self._usb_run_start else 0.0)),
@@ -323,6 +333,8 @@ class LaserEngine:
             has_poll = has_wait and "poll_s" in inspect.signature(dac.wait_ready).parameters
         except (TypeError, ValueError):
             has_poll = False
+        timed = self.poll_mode == "timed" and has_wait  # open loop: no status polling (needs a DAC that takes assume_ready)
+        next_t = 0.0                                    # timed mode: when the next frame is due
         last_sent = 0
         dark = False                                    # output currently stopped because frames went missing
         busy_until = last_dur = 0.0                     # host-side model of the DAC's queue: when it will want the next frame
@@ -345,7 +357,7 @@ class LaserEngine:
         def survive(e: Exception, stage: str, n_pts: int = 0) -> bool:
             """A transient USB error (timeout, busy, interrupted ...) is ridden out for usb_grace_s: count it, back off,
             try again with the next frame. Anything else, or a run that lasts too long, is a real failure."""
-            nonlocal err_since, busy_until, run_n
+            nonlocal err_since, busy_until, run_n, next_t
             now = time.monotonic()
             gap = f"{1000 * (now - last_write_t):.0f} ms after the last frame" if last_write_t else "before the first frame"
             n_pts = n_pts or last_n
@@ -369,7 +381,7 @@ class LaserEngine:
             if now - err_since > self.usb_grace_s:
                 note(f"USB errors lasted over {self.usb_grace_s:g} s: giving up")
                 return False
-            busy_until = 0.0
+            busy_until = next_t = 0.0
             self._stop.wait(0.005)
             return True
 
@@ -382,24 +394,31 @@ class LaserEngine:
                     dac.stop()
                 except Exception as e:                  # a failing Stop must not kill the writer
                     self._fail(str(e))
-                last_sent, dark, busy_until, err_since, run_n = 0, False, 0.0, 0.0, 0
+                last_sent, dark, busy_until, err_since, run_n, next_t = 0, False, 0.0, 0.0, 0, 0.0
             if not armed or not self.dac_ok:
                 self._stop.wait(0.005)
                 continue
-            if has_wait and self.adaptive_poll:         # polling the DAC over USB is not free (and a Pi 3 has no CPU to spare):
-                eta = busy_until - last_dur - time.monotonic() - 0.004
-                if eta > 0:                             # sleep until shortly before it can want a frame, then poll finely
-                    self._stop.wait(min(eta, 0.1))
-            try:
-                if has_wait:
-                    if has_poll:
-                        dac.wait_ready(1.0, poll_s=0.001 if self.adaptive_poll else 0.0005)   # ready -> only now choose WHICH frame
-                    else:
-                        dac.wait_ready(1.0)
-            except Exception as e:
-                if not survive(e, "waiting for the DAC (GetStatus)", last_n):
-                    self._fail(str(e))
-                continue
+            if timed:                                   # OPEN LOOP: wait for the schedule, never for the DAC
+                t_now = time.monotonic()
+                if next_t > t_now:
+                    self._stop.wait(min(next_t - t_now, 0.1))
+                    if time.monotonic() < next_t - 0.0005:
+                        continue                        # woke early or the wait was long: re-check the flags first
+            else:
+                if has_wait and self.adaptive_poll:     # polling the DAC over USB is not free (and a Pi 3 has no CPU to spare):
+                    eta = busy_until - last_dur - time.monotonic() - 0.004
+                    if eta > 0:                         # sleep until shortly before it can want a frame, then poll finely
+                        self._stop.wait(min(eta, 0.1))
+                try:
+                    if has_wait:
+                        if has_poll:
+                            dac.wait_ready(1.0, poll_s=0.001 if self.adaptive_poll else 0.0005)   # ready -> only now choose WHICH frame
+                        else:
+                            dac.wait_ready(1.0)
+                except Exception as e:
+                    if not survive(e, "waiting for the DAC (GetStatus)", last_n):
+                        self._fail(str(e))
+                    continue
             with self._mb_lock:
                 seq, pts, built = self._mb
             with self._lock:                            # an ARM-off / BLACKOUT that arrived while we waited wins
@@ -412,13 +431,14 @@ class LaserEngine:
                         dac.stop()
                     except Exception as e:
                         self._fail(str(e))
-                    dark, busy_until = True, 0.0
+                    dark, busy_until, next_t = True, 0.0, 0.0
                     if pts is not None:                 # (an empty mailbox is a refusal or start-up, counted elsewhere)
                         with self._lock:
                             self._s["dark"] += 1
                 self._stop.wait(0.005)
                 continue
             repeat = seq == last_sent
+            t_w0 = time.monotonic()
             try:
                 if has_wait:
                     dac.write(pts, self.pps, assume_ready=True)
@@ -433,6 +453,8 @@ class LaserEngine:
             last_n = len(pts)
             last_dur = len(pts) / float(self.pps)
             busy_until = max(now2, busy_until) + last_dur
+            if timed:                                   # the next frame is due one frame duration (+ the gap) after THIS write started
+                next_t = max(next_t, t_w0) + last_dur + self.frame_gap_s
             if run_n:
                 note(f"USB recovered after {run_n} error(s), {1000 * (now2 - err_since):.0f} ms")
                 self._usb_runs += 1

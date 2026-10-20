@@ -1028,9 +1028,14 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--usb-log-file", metavar="FILE",
                    help="with --laser: append EVERY USB event (error, recovery) to this file (the terminal shows a rate-limited "
                         "version). A small file you can attach to the chat")
-    g.add_argument("--usb-polling", choices=("adaptive", "fast"), default="adaptive",
-                   help="how the DAC is polled for 'ready': adaptive = sleep until shortly before it can be (default, ~5 polls per "
-                        "frame); fast = poll every 0.5 ms like the older versions (~40 per frame). For comparing on a given Pi")
+    g.add_argument("--usb-polling", choices=("adaptive", "fast", "timed"), default="adaptive",
+                   help="how frames are paced to the DAC: adaptive (default) / fast = ask 'ready?' over USB before each frame; "
+                        "timed = NEVER poll the status: write on a fixed schedule (one frame every its own duration + --frame-gap-ms). "
+                        "Measured on a Raspberry Pi 4: polling during streaming makes the DAC go silent for ~2.4 s about once per "
+                        "2000 polls, while timed writes ran clean")
+    g.add_argument("--frame-gap-ms", type=float, default=1.5, metavar="MS",
+                   help="with --usb-polling timed: the DAC idles this long between frames (default 1.5 = ~5%% of the light; the value "
+                        "tested; smaller puts writes closer to the frame boundary)")
     g.add_argument("--viz-fps", type=float, default=30.0, metavar="FPS",
                    help="ceiling for the on-screen visualiser's frame rate (default 30; ~15 saves a Raspberry Pi's browser a lot of "
                         "work). It also slows down by itself when the hub is overloaded")
@@ -1179,6 +1184,8 @@ def main(argv=None) -> int:
             errs.append("--auto-disarm cannot be negative")
         if not 50 <= args.max_stale_ms <= 2000:
             errs.append("--max-stale-ms must be 50-2000")
+        if not 0 <= args.frame_gap_ms <= 10:
+            errs.append("--frame-gap-ms must be 0-10")
         if not 100 <= args.usb_grace_ms <= 10000:
             errs.append("--usb-grace-ms must be 100-10000")
         if not 2 <= args.viz_fps <= 60:
@@ -1205,7 +1212,7 @@ def main(argv=None) -> int:
             max_intensity=args.max_intensity, max_size=args.max_size, auto_disarm_s=args.auto_disarm * 60.0,
             bpm=args.bpm, tol_bpm=args.tol_bpm, demo_speed=args.demo_speed, min_extent=args.min_extent,
             max_stale_s=args.max_stale_ms / 1000.0, usb_grace_s=args.usb_grace_ms / 1000.0, viz_fps=args.viz_fps,
-            adaptive_poll=args.usb_polling == "adaptive", usb_log=UsbLogSink(args.usb_log_file, RateLimitedPrinter()) if dac is not None else None)
+            adaptive_poll=args.usb_polling == "adaptive", poll_mode=args.usb_polling, frame_gap_s=args.frame_gap_ms / 1000.0, usb_log=UsbLogSink(args.usb_log_file, RateLimitedPrinter()) if dac is not None else None)
         engine.start()
 
         def _selfcheck() -> None:                                # a dashboard that is quietly blank is the worst failure

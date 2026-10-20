@@ -726,7 +726,7 @@ def cmd_streamtest(args) -> int:
     try:
         print(f"DAC    : {dac.name or '(unnamed)'}  firmware {dac.firmware}  ({dac.lib_path})")
         print(f"streamtest, mode {args.mode}: {n} DARK points per frame ({1000 * period:.1f} ms), budget {args.seconds:g} s, up to {args.cycles} failure(s) "
-              f"({'asks ready? before each frame' if args.mode == 'poll' else 'fixed timing, NO status polling at all'})")
+              f"({'asks ready? before each frame' if args.mode == 'poll' else ('fixed timing, NO status polling at all' if args.poll_at is None else f'fixed timing, one status poll per frame at {args.poll_at:g} of the frame')})")
         end = time.monotonic() + args.seconds
         while time.monotonic() < end and len(episodes) < args.cycles:
             streak0 = time.monotonic()
@@ -737,9 +737,15 @@ def cmd_streamtest(args) -> int:
                 try:
                     if args.mode == "poll":
                         dac.wait_ready(1.0, poll_s=0.001)
+                    t_w = time.monotonic()
                     dac.write(pts, pps, assume_ready=True)
                     frames += 1
                     if args.mode == "timed":
+                        if args.poll_at is not None:             # ONE status poll per frame, at this fraction of the frame
+                            time.sleep(max(0.0, t_w + args.poll_at * period - time.monotonic()))
+                            st_ = dac.status_raw()
+                            if st_ < 0:
+                                raise HD.usb_error("GetStatus failed", st_)
                         nxt += period + 0.0015
                         time.sleep(max(0.0, nxt - time.monotonic()))
                 except HeliosError as e:
@@ -826,6 +832,7 @@ def cmd_bench(args) -> int:
                         scene=args.scene, sync=args.sync if args.sync is not None else 0.5, sync_mode="hold",
                         max_intensity=0.0,                  # the engine clamps every colour to 0: the beam cannot light
                         auto_disarm_s=0, min_extent=args.min_extent, adaptive_poll=args.usb_polling == "adaptive",
+                        poll_mode=args.usb_polling, frame_gap_s=args.frame_gap_ms / 1000.0,
                         usb_grace_s=3600.0)              # transient USB errors never latch here: a persistent failure is MEASURED, not cut short
     try:
         print(f"bench: scene {args.scene}, six simulated pods, {args.seconds:g} s measured, pps {args.pps}, frame {args.frame_ms:g} ms")
@@ -1167,7 +1174,7 @@ def cmd_diag(args) -> int:
             return EXIT_USAGE
     rounds = max(1, args.rounds)
     seg = max(5.0, args.seconds / rounds)
-    print(f"diag: collecting system facts, then dark bench runs: {rounds} x (adaptive, fast) of {seg:g} s each, interleaved "
+    print(f"diag: collecting system facts, then dark bench runs: {rounds} x ({args.bench_modes}) of {seg:g} s each, interleaved "
           f"so that drift in the machine does not favour one mode. Nothing is emitted.")
     system = _diag_system() + [""] + _diag_sdk(args)
     import re as _re
@@ -1208,9 +1215,10 @@ def cmd_diag(args) -> int:
             res = next((l for l in out.splitlines() if l.startswith("RESULT")), "RESULT: (no result: " + (err.strip()[-100:] or f"exit {rc}") + ")")
             streams.append({"mode": mode, "out": out, "rc": rc, "res": res})
             print(res.replace("RESULT ", ""))
-    runs: "dict[str, list]" = {"adaptive": [], "fast": []}
+    modes = [m.strip() for m in args.bench_modes.split(",") if m.strip() in ("adaptive", "fast", "timed")] or ["adaptive", "timed"]
+    runs: "dict[str, list]" = {m: [] for m in modes}
     for r in range(rounds):
-        for mode in ("adaptive", "fast"):
+        for mode in modes:
             settle(f"before round {r + 1} {mode}")
             print(f"  round {r + 1}/{rounds}, DAC polling {mode} ... ", end="", flush=True)
             out, err, rc = _diag_bench(args, mode, seg)
@@ -1369,6 +1377,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("streamtest", help="stream DARK frames without the engine until the DAC stops answering; measure how long it stays silent")
     p.add_argument("--mode", choices=("poll", "timed"), default="poll",
                    help="poll = ask 'ready?' before each frame (like the engine); timed = fixed timing, never poll the status")
+    p.add_argument("--poll-at", type=float, default=None, metavar="FRACTION",
+                   help="with --mode timed: make ONE status poll per frame at this fraction of the frame (0.5 = mid-frame, 1.0 = at its end), "
+                        "to see whether the hazard depends on when in the frame the poll happens")
     p.add_argument("--seconds", type=float, default=60.0, help="total time budget (default 60)")
     p.add_argument("--cycles", type=int, default=3, help="stop after this many failures (default 3)")
     p.add_argument("--points", type=int, default=570, help="points per frame (default 570, ~28.5 ms at 20000 pps)")
@@ -1386,9 +1397,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seconds", type=float, default=15.0, help="measuring time after a 2 s warm-up (default 15)")
     p.add_argument("--palette", choices=sorted(P.PALETTES), default="gsr")
     p.add_argument("--dry-run", action="store_true", help="no DAC at all: measures only the computer")
-    p.add_argument("--usb-polling", choices=("adaptive", "fast"), default="adaptive",
-                   help="adaptive (default: sleeps most of the learned wait, then polls) or fast (poll continuously, like the oldest "
-                        "versions): compare the USB errors per minute")
+    p.add_argument("--usb-polling", choices=("adaptive", "fast", "timed"), default="adaptive",
+                   help="adaptive (default) / fast: ask 'ready?' before each frame; timed: NEVER poll the status, write on a fixed schedule")
+    p.add_argument("--frame-gap-ms", type=float, default=1.5, help="timed mode: idle gap between frames (default 1.5 ms)")
     p.add_argument("--events", type=int, default=6, help="how many USB error lines to print (first and last; default 6)")
     p.add_argument("--lib", help="path to the Helios library (or set $HELIOS_LIB)")
     p.add_argument("--device", type=int, default=0, help="DAC number if several are connected")
@@ -1401,6 +1412,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--idle-seconds", type=float, default=10.0, help="length of each idle-polling test (no frames), run at 3 ms and 30 ms (default 10; 0 = skip)")
     p.add_argument("--stream-seconds", type=float, default=40.0, help="budget of each of the two streaming tests without the engine (poll, timed; default 40; 0 = skip)")
     p.add_argument("--probes", type=int, default=3, help="how many times to read the DAC's name and firmware first (default 3; 0 = skip)")
+    p.add_argument("--bench-modes", default="adaptive,timed",
+                   help="which pacing modes the engine benches compare, interleaved (default adaptive,timed; any of adaptive, fast, timed)")
     p.add_argument("--rounds", type=int, default=2, help="how many times each mode is run, interleaved adaptive, fast, adaptive, fast ... (default 2)")
     p.add_argument("--out", help="the report file (default diag_<host>_<time>.txt in the current folder)")
     p.add_argument("--libusb-debug", type=int, default=2, choices=(0, 1, 2, 3, 4),
