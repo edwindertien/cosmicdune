@@ -34,7 +34,8 @@ fake data source for this dashboard.
 
 Usage:
     python3 osc_web_dashboard.py                        # dashboard + visualiser, NO laser (preview)
-    python3 osc_web_dashboard.py --laser                # + drive the Helios DAC (starts SAFE; ARM on screen)
+    python3 osc_web_dashboard.py --laser                # + drive the Helios DAC (starts SAFE; ARM on screen). Defaults: LEVEL starts
+                                                        #   at 0.4 and goes to 0.8, frames paced without polling the DAC (--usb-polling timed)
     python3 osc_web_dashboard.py --osc-port 9000 --web-port 5000
     python3 osc_test_hub.py simulate --port 9000        # fake pods, for testing
     (calibration/shape options are the same as laser/laser_test.py: --size --intensity --pps --rgb-min ...)
@@ -1000,6 +1001,13 @@ def build_app(dashboard, engine, local_ips, have_chart: bool, osc_port: int, all
     return app
 
 
+# What the hub starts with when you just say --laser. These are the values proven on the real laser (Raspberry Pi 4, Helios, CUBE 3);
+# the bench tools (laser_test.py) keep their own, more timid defaults.
+HUB_MAX_INTENSITY = 0.8        # the LEVEL slider's ceiling
+HUB_INTENSITY = 0.4            # where LEVEL starts (or --max-intensity, if that is lower)
+HIGH_INTENSITY_GATE = 0.8      # a --max-intensity / --intensity ABOVE this needs --allow-high
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--osc-port", type=int, default=9000, help="UDP port to receive pod telemetry on")
@@ -1013,8 +1021,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="where the scenes get their pods: live pods, live + simulated fill, or all simulated (default demo)")
     g.add_argument("--scene", default="converge", help="scene shown at start")
     g.add_argument("--palette", choices=("gsr", "spectrum"), default="gsr")
-    g.add_argument("--max-intensity", type=float, default=0.3,
-                   help="the LEVEL slider's ceiling, enforced on the server (default 0.3; >0.5 needs --allow-high)")
+    g.add_argument("--max-intensity", type=float, default=HUB_MAX_INTENSITY,
+                   help=f"the LEVEL slider's ceiling, enforced on the server (default {HUB_MAX_INTENSITY:g}; above {HIGH_INTENSITY_GATE:g} needs --allow-high)")
     g.add_argument("--max-size", type=float, default=0.6, help="the SIZE slider's ceiling (default 0.6)")
     g.add_argument("--auto-disarm", type=float, default=20.0, metavar="MIN",
                    help="disarm after this many minutes without any control activity (default 20; 0 = never)")
@@ -1025,20 +1033,83 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--usb-grace-ms", type=int, default=1000, metavar="MS",
                    help="with --laser: transient USB errors (a timeout, 'libusb error -7') are ridden out for this long before the "
                         "laser is disarmed with an error (default 1000)")
+    g.add_argument("--usb-log-file", metavar="FILE",
+                   help="with --laser: append EVERY USB event (error, recovery) to this file (the terminal shows a rate-limited "
+                        "version). A small file you can attach to the chat")
+    g.add_argument("--usb-polling", choices=("adaptive", "fast", "timed"), default="timed",
+                   help="how frames are paced to the DAC: timed (default) = NEVER poll the status: write on a fixed schedule (one frame "
+                        "every its own duration + --frame-gap-ms); adaptive / fast = ask 'ready?' over USB before each frame. "
+                        "Measured on a Raspberry Pi 4: polling during streaming makes the DAC go silent for ~2.4 s about once per "
+                        "2000 polls, while timed writes ran clean")
+    g.add_argument("--frame-gap-ms", type=float, default=1.5, metavar="MS",
+                   help="with --usb-polling timed: the DAC idles this long between frames (default 1.5 = ~5%% of the light; the value "
+                        "tested; smaller puts writes closer to the frame boundary)")
     g.add_argument("--viz-fps", type=float, default=30.0, metavar="FPS",
                    help="ceiling for the on-screen visualiser's frame rate (default 30; ~15 saves a Raspberry Pi's browser a lot of "
                         "work). It also slows down by itself when the hub is overloaded")
     g.add_argument("--perf", nargs="?", const=5.0, type=float, default=None, metavar="SECONDS",
                    help="print every SECONDS (default 5) where the CPU goes: per thread, per stage of a frame, and the board's clock "
                         "and throttling. Run it on the Pi and send me the lines")
-    g.add_argument("--allow-high", action="store_true", help="permit --max-intensity above 0.5")
+    g.add_argument("--allow-high", action="store_true",
+                   help=f"permit --max-intensity / --intensity above {HIGH_INTENSITY_GATE:g} (what you have validated on the real laser)")
     g.add_argument("--allow-remote-control", action="store_true",
                    help="with --laser, accept control (incl. ARM) from other machines too. DANGEROUS on an open hotspot")
     g.add_argument("--tol-bpm", type=float, default=10.0, help="BPM spread at which measured sync reaches 0")
     g.add_argument("--demo-speed", type=float, default=1.0, help="demo pods: speed multiplier")
     if LT is not None:
         LT.add_view_args(ap)           # --size --intensity --pps --frame-ms --rgb-min --blank-shift ... (as laser_test.py)
+        ap.set_defaults(intensity=None)            # the hub picks its own starting LEVEL (see main); the bench tools keep 0.15
+        for act in ap._actions:
+            if "--intensity" in act.option_strings:
+                act.help = f"where the LEVEL slider starts (default {HUB_INTENSITY:g}, or --max-intensity if that is lower)"
     return ap
+
+
+class RateLimitedPrinter:
+    """Prints at most `per_second` lines a second and then says how many it held back, so a burst of USB errors tells the
+    whole story at the start without flooding the terminal."""
+
+    def __init__(self, per_second: float = 4.0, out=None) -> None:
+        self.per_second, self.out = per_second, out
+        self._lock = threading.Lock()
+        self._window, self._n, self._held = 0.0, 0, 0
+
+    def __call__(self, line: str) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if now - self._window >= 1.0:
+                held, self._held, self._n, self._window = self._held, 0, 0, now
+                if held:
+                    print(f"      ... {held} more USB line(s) held back", file=self.out or sys.stdout, flush=True)
+            if self._n < self.per_second:
+                self._n += 1
+                print(line, file=self.out or sys.stdout, flush=True)
+            else:
+                self._held += 1
+
+
+class UsbLogSink:
+    """Every USB event goes to the log FILE (capped, so a long error storm cannot fill the disk) and, rate-limited, to the terminal."""
+
+    def __init__(self, path, printer, cap_bytes: int = 500_000) -> None:
+        self.printer, self.cap, self.written, self.fh = printer, cap_bytes, 0, None
+        if path:
+            self.fh = open(path, "a", encoding="utf-8")
+            self._write(f"--- hub started {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
+
+    def _write(self, line: str) -> None:
+        if self.fh and self.written < self.cap:
+            self.fh.write(line + "\n")
+            self.fh.flush()
+            self.written += len(line) + 1
+            if self.written >= self.cap:
+                self.fh.write("--- log size cap reached: no more lines are written to this file ---\n")
+                self.fh.flush()
+
+    def __call__(self, line: str) -> None:
+        if self.printer:
+            self.printer(line)
+        self._write(line)
 
 
 def start_perf_reporter(engine, interval: float) -> None:
@@ -1104,7 +1175,11 @@ def start_perf_reporter(engine, interval: float) -> None:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    if LT is not None:
+    explicit_high = args.allow_high
+    if LT is not None:                 # (without the laser/ folder these shared options do not exist, and the hub must still start)
+        if args.intensity is None:     # not given: start at the hub default, but never above the ceiling
+            args.intensity = min(HUB_INTENSITY, args.max_intensity) if args.max_intensity > 0 else HUB_INTENSITY
+        args.allow_high = True         # laser_test.check_args gates at 0.5 for the BENCH tools; the hub's own gate (below) replaces it
         LT.check_args(args)            # exits 2 with a message on a bad shared option
     if args.laser and LT is None:
         print(f"error: --laser cannot start, the laser code did not load: {LASER_IMPORT_ERROR}\n"
@@ -1114,8 +1189,10 @@ def main(argv=None) -> int:
         errs = []
         if not 0.0 < args.max_intensity <= 1.0:
             errs.append("--max-intensity must be above 0 and at most 1")
-        if args.max_intensity > 0.5 and not args.allow_high:
-            errs.append("--max-intensity above 0.5 needs --allow-high")
+        if args.max_intensity > HIGH_INTENSITY_GATE and not explicit_high:
+            errs.append(f"--max-intensity above {HIGH_INTENSITY_GATE:g} needs --allow-high")
+        if args.intensity > HIGH_INTENSITY_GATE and not explicit_high:
+            errs.append(f"--intensity above {HIGH_INTENSITY_GATE:g} needs --allow-high")
         if not 0.1 <= args.max_size <= 1.0:
             errs.append("--max-size must be 0.1-1.0")
         if args.intensity > args.max_intensity:
@@ -1126,6 +1203,8 @@ def main(argv=None) -> int:
             errs.append("--auto-disarm cannot be negative")
         if not 50 <= args.max_stale_ms <= 2000:
             errs.append("--max-stale-ms must be 50-2000")
+        if not 0 <= args.frame_gap_ms <= 10:
+            errs.append("--frame-gap-ms must be 0-10")
         if not 100 <= args.usb_grace_ms <= 10000:
             errs.append("--usb-grace-ms must be 100-10000")
         if not 2 <= args.viz_fps <= 60:
@@ -1151,7 +1230,8 @@ def main(argv=None) -> int:
             sync=args.sync if args.sync is not None else 0.0, sync_mode="hold" if args.sync is not None else "auto",
             max_intensity=args.max_intensity, max_size=args.max_size, auto_disarm_s=args.auto_disarm * 60.0,
             bpm=args.bpm, tol_bpm=args.tol_bpm, demo_speed=args.demo_speed, min_extent=args.min_extent,
-            max_stale_s=args.max_stale_ms / 1000.0, usb_grace_s=args.usb_grace_ms / 1000.0, viz_fps=args.viz_fps)
+            max_stale_s=args.max_stale_ms / 1000.0, usb_grace_s=args.usb_grace_ms / 1000.0, viz_fps=args.viz_fps,
+            adaptive_poll=args.usb_polling == "adaptive", poll_mode=args.usb_polling, frame_gap_s=args.frame_gap_ms / 1000.0, usb_log=UsbLogSink(args.usb_log_file, RateLimitedPrinter()) if dac is not None else None)
         engine.start()
 
         def _selfcheck() -> None:                                # a dashboard that is quietly blank is the worst failure
@@ -1186,7 +1266,8 @@ def main(argv=None) -> int:
         print(f"\nLASER: DAC {dac.name or '(unnamed)'} firmware {dac.firmware} open, output SAFE (dark). "
               f"ARM on the touch screen. Limits: LEVEL <= {args.max_intensity}, SIZE <= {args.max_size}; "
               f"auto-disarm {'off' if not args.auto_disarm else f'after {args.auto_disarm:g} min'}; "
-              f"dark if no new frame for {args.max_stale_ms} ms; USB errors ridden out for {args.usb_grace_ms} ms; "
+              f"dark if no new frame for {args.max_stale_ms} ms; USB errors ridden out for {args.usb_grace_ms} ms (logged); "
+              f"DAC polling {args.usb_polling}; "
               f"controls from {'ANY machine (!)' if args.allow_remote_control else 'this machine only'}.")
 
     app = build_app(dashboard, engine, local_ips, have_chart, args.osc_port, args.allow_remote_control)
