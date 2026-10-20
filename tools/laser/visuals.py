@@ -30,7 +30,7 @@ from __future__ import annotations
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
 from patterns import Color, Stroke, circle_pts, gradient
@@ -445,6 +445,50 @@ class Spokes(Scene):
 
 
 SCENES: Dict[str, type] = {"converge": Converge, "merge": Merge, "bloom": Bloom, "ripple": Ripple, "spokes": Spokes}
+
+
+def lit_extent(strokes: List[Stroke], view) -> float:
+    """Widest side of the lit pattern's bounding box in final field units (the full scan field is 2.0
+    wide), i.e. how big the pattern really is on the wall. Fast path when the view has no rotation."""
+    xs_lo = ys_lo = 1e9
+    xs_hi = ys_hi = -1e9
+    rotated = bool(view.rotate_deg)
+    for s in strokes:
+        if len(s.pts) < 2:
+            continue
+        for x, y in s.pts:
+            if rotated:
+                x, y = view.apply(x, y)
+            if x < xs_lo: xs_lo = x
+            if x > xs_hi: xs_hi = x
+            if y < ys_lo: ys_lo = y
+            if y > ys_hi: ys_hi = y
+    if xs_hi < xs_lo:
+        return 0.0
+    ext = max(xs_hi - xs_lo, ys_hi - ys_lo)
+    return ext if rotated else ext * view.size
+
+
+def fit_min_extent(strokes: List[Stroke], view, min_extent: float, max_size: float = 1.0):
+    """Never let the lit pattern get smaller than `min_extent` (field units): if it would, enlarge the whole
+    pattern about the centre -- by scaling the view's size, per frame, so it varies smoothly with the pulse
+    -- but never beyond `max_size` (default: the full scan field). The cap is NOT the SIZE slider's maximum:
+    an enlargement only happens when the pattern is small, and its result is then exactly `min_extent`, so
+    it cannot grow the pattern's footprint. Returns (view to render with, boost factor >= 1).
+
+    WHY: the scan-fail safety of Laserworld projectors can block "a single beam or a very small pattern"
+    (Laserworld FAQ), and a small pattern also concentrates the beam. Scenes are smallest when every pod
+    pulses in unison (high sync), so that is exactly when this matters. Only for scenes: the static test
+    patterns are left alone so small sizes can still be tried deliberately."""
+    if min_extent <= 0:
+        return view, 1.0
+    ext = lit_extent(strokes, view)
+    if ext <= 1e-9 or ext >= min_extent:
+        return view, 1.0
+    size_eff = min(max(view.size, max_size), view.size * (min_extent / ext))
+    if size_eff <= view.size:
+        return view, 1.0
+    return replace(view, size=size_eff), size_eff / view.size
 
 
 def scene_min_r(size: float) -> float:

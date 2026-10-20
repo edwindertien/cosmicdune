@@ -652,7 +652,11 @@ def _machine_line() -> str:
 
 def cmd_bench(args) -> int:
     """Measure whether this computer can feed the DAC: the hub's real pipeline, colours forced to ZERO (nothing is emitted)."""
-    import engine as E
+    try:
+        import engine as E
+    except ImportError as e:                                # e.g. a visuals.py from an older update
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_USAGE
     check_args(args)
     if args.scene not in V.SCENES:
         print(f"unknown scene {args.scene!r}; try `list`", file=sys.stderr)
@@ -692,6 +696,13 @@ def cmd_bench(args) -> int:
     wall = w1 - w0
     built, sent = s1["frames"] - s0["frames"], s1["sent"] - s0["sent"]
     late, dark = s1["late"] - s0["late"], s1["dark"] - s0["dark"]
+    if built <= 0 or sent <= 0:                             # never call that "keeps up": nothing was measured
+        print()
+        print(f"FAILED: {'the engine produced NO frames' if built <= 0 else 'frames were built but none reached the DAC'} "
+              f"in {wall:.0f} s (built {built}, sent {sent}, refused {s1['refused']}).")
+        print(f"        last problem: {s1['last_refusal'] or '(none recorded)'}")
+        print("        This is not a speed result. Check that every file of the laser/ folder is from the same update.")
+        return EXIT_DEVICE
     period = s1["frame_ms"]
     usb = s1.get("usb") or {}
     print()

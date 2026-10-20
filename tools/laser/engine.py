@@ -31,6 +31,7 @@ SAFETY MODEL
 from __future__ import annotations
 
 import collections
+import os
 import struct
 import threading
 import time
@@ -39,6 +40,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import patterns as P
 import visuals as V
+
+# The files of this folder are updated one by one by hand, so a stale one is a real risk. Without this check an old
+# visuals.py made the engine's thread die on its first frame: no frames, no laser output, a silent dashboard.
+_MISSING = [n for n in ("fit_min_extent", "lit_extent") if not hasattr(V, n)]
+if _MISSING:
+    raise ImportError(f"visuals.py is older than engine.py (it lacks {', '.join(_MISSING)}). "
+                      f"Copy the new visuals.py into {os.path.dirname(os.path.abspath(V.__file__))} and start again.")
 
 # Smallest size the UI/engine will accept: below ~0.08 the smallest ring of a scene is under the
 # validator's static-dot limit and every frame would be refused (a blank visualiser).
@@ -98,7 +106,7 @@ class LaserEngine:
         self._s = {"frames": 0, "late": 0, "refused": 0, "points": 0, "frame_ms": 0.0, "fps": 0.0,
                    "measured": 0.0, "effective": 0.0, "live": 0, "online": 0, "last_refusal": "",
                    "extent": 0.0, "boost": 1.0, "peak_rgb": (0, 0, 0),
-                   "dark": 0, "sent": 0, "build_ms": 0.0, "build_max_ms": 0.0, "load": 0.0}
+                   "dark": 0, "sent": 0, "build_ms": 0.0, "build_max_ms": 0.0, "load": 0.0, "refusal_t": 0.0}
 
     # ------------------------------------------------------------------ controls
     def control(self, patch: Dict) -> Tuple[bool, str]:
@@ -171,6 +179,7 @@ class LaserEngine:
             "measured_sync": round(s["measured"], 3), "effective_sync": round(s["effective"], 3),
             "pods_online": s["online"], "pods_live": s["live"],
             "frames": s["frames"], "late": s["late"], "refused": s["refused"], "last_refusal": s["last_refusal"],
+            "refusal_age_s": round(now - s["refusal_t"], 1) if s["refusal_t"] else None,
             "points": s["points"], "frame_ms": round(s["frame_ms"], 1), "fps": round(s["fps"], 1), "seq": seq,
             "min_extent": self.min_extent, "extent": round(s["extent"], 3), "boost": round(s["boost"], 2),
             "peak_rgb": list(s["peak_rgb"]),
@@ -364,6 +373,7 @@ class LaserEngine:
                 with self._lock:
                     self._s["refused"] += 1
                     self._s["last_refusal"] = str(e)
+                    self._s["refusal_t"] = time.monotonic()
                 time.sleep(0.02)
                 continue
             except Exception as e:                           # a bug in a pattern must not take the engine down
@@ -371,24 +381,34 @@ class LaserEngine:
                 with self._lock:
                     self._s["refused"] += 1
                     self._s["last_refusal"] = f"{type(e).__name__}: {e}"
+                    self._s["refusal_t"] = time.monotonic()
                 time.sleep(0.05)
                 continue
-            pts = P.to_dac(fr)
-            extent = V.lit_extent(strokes, view)
-            peak = (max(p[2] for p in pts), max(p[3] for p in pts), max(p[4] for p in pts))
-            self._publish(pts)
-            self._offer(pts)
-            built = time.monotonic() - now                   # how long the computer needed for this frame
-            self._build_hist.append(built)
-            period = fr.duration_ms / 1000.0
-            with self._lock:
-                s = self._s
-                s["frames"] += 1
-                avg = sum(self._build_hist) / len(self._build_hist)
-                s.update(points=len(fr.points), frame_ms=fr.duration_ms, fps=fr.fps, measured=measured,
-                         effective=effective, online=len(online), live=sum(1 for p in online if not p.simulated),
-                         extent=extent, boost=boost, peak_rgb=peak, build_ms=avg * 1000.0,
-                         build_max_ms=max(self._build_hist) * 1000.0, load=avg / period if period > 0 else 0.0)
+            try:                                             # NOTHING in here may kill the thread: a dead producer is a silent dashboard
+                pts = P.to_dac(fr)
+                extent = V.lit_extent(strokes, view)
+                peak = (max(p[2] for p in pts), max(p[3] for p in pts), max(p[4] for p in pts))
+                self._publish(pts)
+                self._offer(pts)
+                built = time.monotonic() - now               # how long the computer needed for this frame
+                self._build_hist.append(built)
+                period = fr.duration_ms / 1000.0
+                with self._lock:
+                    s = self._s
+                    s["frames"] += 1
+                    avg = sum(self._build_hist) / len(self._build_hist)
+                    s.update(points=len(fr.points), frame_ms=fr.duration_ms, fps=fr.fps, measured=measured,
+                             effective=effective, online=len(online), live=sum(1 for p in online if not p.simulated),
+                             extent=extent, boost=boost, peak_rgb=peak, build_ms=avg * 1000.0,
+                             build_max_ms=max(self._build_hist) * 1000.0, load=avg / period if period > 0 else 0.0)
+            except Exception as e:
+                self._invalidate()
+                with self._lock:
+                    self._s["refused"] += 1
+                    self._s["last_refusal"] = f"{type(e).__name__}: {e}"
+                    self._s["refusal_t"] = time.monotonic()
+                time.sleep(0.05)
+                continue
             if self._wthread is not None and c["armed"] and self.dac_ok:
                 self._taken.wait(0.1)                        # armed: the DAC's consumption paces us ...
                 self._taken.clear()                          # ... and when it is starved we simply run flat out

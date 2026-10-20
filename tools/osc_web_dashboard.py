@@ -842,17 +842,19 @@ function renderLaser(s) {
   $('panel-laser').classList.toggle('ro', !s.can_control);
   renderArm();
   // load = how much of each frame period the computer spends BUILDING a frame (100% = cannot keep up);
-  // rep = frames the DAC had to re-send because the next one was not ready; dark = times output stopped for lack of frames
-  let l1 = s.points + ' pts  ' + s.frame_ms + ' ms  ' + s.fps + ' fps  load ' + Math.round(100 * s.load) + '%';
-  if (s.laser && s.mode === 'armed') l1 += '  rep ' + s.late + (s.dark ? '  dark ' + s.dark : '');
+  // sent = frames handed to the DAC so far (must keep rising while armed); rep = frames re-sent because the next one was not ready;
+  // dark = times output stopped for lack of frames
+  let l1 = s.points + ' pts  ' + s.frame_ms + ' ms  ' + s.fps + ' fps  load ' + Math.round(100 * (s.load || 0)) + '%';
+  if (s.laser && s.mode === 'armed') l1 += '  sent ' + (s.sent || 0) + '  rep ' + (s.late || 0) + (s.dark ? '  dark ' + s.dark : '');
   if (s.refused) l1 += '  refused ' + s.refused;
   // ext = how wide the lit pattern really is (full field = 2.0); (xN) = enlarged to keep it above --min-extent;
   // rgb = peak 8-bit drive of each colour channel in the last frame
-  const l2 = 'ext ' + s.extent.toFixed(2) + (s.boost > 1.01 ? ' (x' + s.boost.toFixed(1) + ')' : '') +
-             '  rgb ' + s.peak_rgb.join('/') + '  pods ' + s.pods_online + '/6 live ' + s.pods_live;
+  const l2 = 'ext ' + (s.extent || 0).toFixed(2) + (s.boost > 1.01 ? ' (x' + s.boost.toFixed(1) + ')' : '') +
+             '  rgb ' + (s.peak_rgb || []).join('/') + '  pods ' + s.pods_online + '/6 live ' + s.pods_live;
   $('v-info').textContent = l1 + '\n' + l2;
   if (!s.can_control) $('v-msg').textContent = 'view only: controls work from the hub\'s own screen';
   else if (s.error) $('v-msg').textContent = s.error;
+  else if (s.last_refusal && s.refusal_age_s != null && s.refusal_age_s < 5) $('v-msg').textContent = 'no picture: ' + s.last_refusal;
   else if (s.mode === 'safe' && s.note && /auto-disarm|blackout|error/.test(s.note)) $('v-msg').textContent = s.note;
   else if (!msgTimer || !$('v-msg').textContent.startsWith('control')) { if (s.can_control && !s.error) $('v-msg').textContent = ''; }
 }
@@ -878,7 +880,7 @@ $('back').addEventListener('click', closeDetail);
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && view === 'detail') closeDetail(); });
 document.addEventListener('contextmenu', e => e.preventDefault());
 
-window.cosmicDebug = () => ({ vizSeq: vizSeq, lastFrameAt: lastFrameAt, tab: tab, view: view });   // for tests
+window.cosmicDebug = () => ({ vizSeq: vizSeq, lastFrameAt: lastFrameAt, tab: tab, view: view, renderLaser: renderLaser });   // for tests
 sizeCanvas();
 loadInfo();
 poll();
@@ -1029,7 +1031,8 @@ def main(argv=None) -> int:
     if LT is not None:
         LT.check_args(args)            # exits 2 with a message on a bad shared option
     if args.laser and LT is None:
-        print(f"error: --laser needs the laser/ folder next to this file ({LASER_IMPORT_ERROR})", file=sys.stderr)
+        print(f"error: --laser cannot start, the laser code did not load: {LASER_IMPORT_ERROR}\n"
+              f"       (the laser/ folder must sit next to this file, and its files must all be from the same update)", file=sys.stderr)
         return 3
     if LT is not None:
         errs = []
@@ -1070,6 +1073,15 @@ def main(argv=None) -> int:
             bpm=args.bpm, tol_bpm=args.tol_bpm, demo_speed=args.demo_speed, min_extent=args.min_extent,
             max_stale_s=args.max_stale_ms / 1000.0)
         engine.start()
+
+        def _selfcheck() -> None:                                # a dashboard that is quietly blank is the worst failure
+            st = engine.state()
+            if st["frames"] == 0:
+                print(f"\nWARNING: the laser engine has produced NO frames after 2.5 s. Last problem: "
+                      f"{st['last_refusal'] or '(none recorded)'}\n         The picture will be blank and nothing can reach the laser.", file=sys.stderr)
+        _t = threading.Timer(2.5, _selfcheck)
+        _t.daemon = True
+        _t.start()
 
     local_ips = get_local_ips()
     have_chart = os.path.exists(CHART_JS_FILE)
