@@ -714,9 +714,14 @@ def cmd_bench(args) -> int:
     if usb:
         print(f"USB (per frame)       waiting for ready {usb['ready_ms']:5.1f} ms avg ({usb['polls']:.0f} polls), "
               f"WriteFrame {usb['write_ms']:4.1f} ms avg / {usb['write_max_ms']:.1f} ms worst")
+    if s1["usb_errors"]:
+        print(f"USB errors survived   {s1['usb_errors']:6d}      last: {s1['last_usb_error']}")
     print(f"this process' CPU     {100.0 * (c1 - c0) / wall:6.0f} %  of one core (all threads together)")
     print()
     repeat_pct = 100.0 * late / max(1, sent)
+    if s1["usb_errors"]:
+        print(f"NOTE: {s1['usb_errors']} transient USB error(s) occurred and were ridden out ({s1['last_usb_error']}). "
+              "A few are normal under load; many mean the USB path or the CPU is struggling.")
     if dark == 0 and repeat_pct < 2.0:
         print("VERDICT: keeps up. Frames reach the DAC on time; the laser would stay lit with a smooth animation.")
     else:
@@ -734,7 +739,9 @@ def cmd_bench(args) -> int:
               f"{f', and output went dark {dark} time(s)' if dark else ''}.")
         for w in why:
             print(f"  - {w}")
-        print("  Try: --pps 15000 (fewer points), close the browser/other programs, `nice -n -5`, a cooler/stronger supply (check throttled above).")
+        print("  Try: run the hub with --perf to see WHERE the CPU goes; start the browser with `nice -n 10`; set the CPU governor to")
+        print("       'performance' and check `vcgencmd get_throttled` is 0x0 (heat / weak supply); --viz-fps 15. (--pps 15000 saves only")
+        print("       ~15-25 %; going lower does not help: the frame cannot shrink below its geometry and starts to look dotted.)")
     return 0
 
 

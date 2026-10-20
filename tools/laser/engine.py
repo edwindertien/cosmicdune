@@ -31,6 +31,7 @@ SAFETY MODEL
 from __future__ import annotations
 
 import collections
+import inspect
 import os
 import struct
 import threading
@@ -73,7 +74,7 @@ class LaserEngine:
                  scene: str = "converge", sync: float = 0.0, sync_mode: str = "auto",
                  max_intensity: float = 0.3, max_size: float = 0.6, auto_disarm_s: float = 1200.0,
                  bpm: float = 72.0, tol_bpm: float = 10.0, demo_speed: float = 1.0,
-                 min_extent: float = 0.0, max_stale_s: float = 0.2) -> None:
+                 min_extent: float = 0.0, max_stale_s: float = 0.2, usb_grace_s: float = 1.0, viz_fps: float = 30.0) -> None:
         self.summary_fn, self.base_view, self.cal = summary_fn, view, cal
         self.pps, self.frame_ms, self.palette = pps, frame_ms, palette
         self.dac = dac
@@ -81,12 +82,15 @@ class LaserEngine:
         self.auto_disarm_s, self.bpm, self.tol_bpm = auto_disarm_s, bpm, tol_bpm
         self.min_extent = max(0.0, float(min_extent))     # scenes never get narrower than this (field units); 0 = off
         self.max_stale_s = max(0.05, float(max_stale_s))  # no new frame for this long while armed -> the writer goes dark
+        self.usb_grace_s = max(0.1, float(usb_grace_s))   # transient USB errors (timeouts...) are ridden out for this long
+        self.viz_fps = max(2.0, float(viz_fps))           # the visualiser's fetch rate ceiling (it backs off when the hub is overloaded)
         self.dac_ok = dac is not None
         self._mb_lock = threading.Lock()
         self._mb: Tuple[int, Optional[List], float] = (0, None, 0.0)   # newest frame for the writer: (seq, points, built at)
         self._taken = threading.Event()                   # the writer sets it each time it sent a frame (paces the producer)
         self._wthread: Optional[threading.Thread] = None
         self._build_hist: collections.deque = collections.deque(maxlen=60)
+        self._stage_hist: collections.deque = collections.deque(maxlen=60)    # per frame: (pods, scene, render, validate, convert, publish) seconds
         self._demo = V.DemoInputs(demo_speed)
         self._lock = threading.Lock()
         self._cond = threading.Condition()
@@ -106,7 +110,8 @@ class LaserEngine:
         self._s = {"frames": 0, "late": 0, "refused": 0, "points": 0, "frame_ms": 0.0, "fps": 0.0,
                    "measured": 0.0, "effective": 0.0, "live": 0, "online": 0, "last_refusal": "",
                    "extent": 0.0, "boost": 1.0, "peak_rgb": (0, 0, 0),
-                   "dark": 0, "sent": 0, "build_ms": 0.0, "build_max_ms": 0.0, "load": 0.0, "refusal_t": 0.0}
+                   "dark": 0, "sent": 0, "build_ms": 0.0, "build_max_ms": 0.0, "load": 0.0, "refusal_t": 0.0,
+                   "usb_errors": 0, "last_usb_error": ""}
 
     # ------------------------------------------------------------------ controls
     def control(self, patch: Dict) -> Tuple[bool, str]:
@@ -186,6 +191,8 @@ class LaserEngine:
             "dark": s["dark"], "sent": s["sent"], "build_ms": round(s["build_ms"], 1),
             "build_max_ms": round(s["build_max_ms"], 1), "load": round(s["load"], 2),
             "max_stale_ms": int(self.max_stale_s * 1000), "usb": self._usb_stats(),
+            "usb_errors": s["usb_errors"], "last_usb_error": s["last_usb_error"], "viz_ms": self._viz_ms(s["load"]),
+            "stages": self._stages(),
             "armed_for_s": round(now - arm_time, 1) if c["armed"] else None,
             "auto_disarm_in_s": round(remaining, 1) if remaining is not None else None,
             "error": err, "note": note,
@@ -193,6 +200,24 @@ class LaserEngine:
         }
 
     # ------------------------------------------------------------------ frames out
+    def _stages(self) -> Dict[str, float]:
+        """Where a frame's build time goes (ms, average of the last ~60 frames)."""
+        h = tuple(self._stage_hist)
+        names = ("pods", "scene", "render", "validate", "convert", "publish")
+        if not h:
+            return {n: 0.0 for n in names}
+        return {n: round(1000.0 * sum(x[i] for x in h) / len(h), 2) for i, n in enumerate(names)}
+
+    def _viz_ms(self, load: float) -> int:
+        """How often the page should fetch a frame. The laser has priority over the screen: when the hub cannot keep
+        up the visualiser slows down by itself (~15 -> ~7 frames/s)."""
+        ms = 1000.0 / self.viz_fps
+        if load >= 0.9:
+            ms = max(ms, 150.0)
+        elif load >= 0.5:
+            ms = max(ms, 66.0)
+        return int(round(ms))
+
     def _usb_stats(self) -> Optional[Dict]:
         fn = getattr(self.dac, "stats", None)
         try:
@@ -271,8 +296,32 @@ class LaserEngine:
         """THE WRITER: the only thread that calls the DAC while the engine runs."""
         dac = self.dac
         has_wait = callable(getattr(dac, "wait_ready", None))
+        try:
+            has_poll = has_wait and "poll_s" in inspect.signature(dac.wait_ready).parameters
+        except (TypeError, ValueError):
+            has_poll = False
         last_sent = 0
         dark = False                                    # output currently stopped because frames went missing
+        busy_until = last_dur = 0.0                     # host-side model of the DAC's queue: when it will want the next frame
+        err_since = 0.0                                 # start of the current run of transient USB errors (0 = none)
+
+        def survive(e: Exception) -> bool:
+            """A transient USB error (timeout, busy, interrupted ...) is ridden out for usb_grace_s: count it, back off,
+            try again with the next frame. Anything else, or a run that lasts too long, is a real failure."""
+            nonlocal err_since, busy_until
+            if not getattr(e, "transient", False):
+                return False
+            now = time.monotonic()
+            err_since = err_since or now
+            with self._lock:
+                self._s["usb_errors"] += 1
+                self._s["last_usb_error"] = str(e)
+            if now - err_since > self.usb_grace_s:
+                return False
+            busy_until = 0.0
+            self._stop.wait(0.005)
+            return True
+
         while not self._stop.is_set():
             with self._lock:
                 armed = self._c["armed"]
@@ -282,15 +331,23 @@ class LaserEngine:
                     dac.stop()
                 except Exception as e:                  # a failing Stop must not kill the writer
                     self._fail(str(e))
-                last_sent, dark = 0, False
+                last_sent, dark, busy_until, err_since = 0, False, 0.0, 0.0
             if not armed or not self.dac_ok:
                 self._stop.wait(0.005)
                 continue
+            if has_wait:                                # polling the DAC over USB is not free (and a Pi 3 has no CPU to spare):
+                eta = busy_until - last_dur - time.monotonic() - 0.004
+                if eta > 0:                             # sleep until shortly before it can want a frame, then poll finely
+                    self._stop.wait(min(eta, 0.1))
             try:
                 if has_wait:
-                    dac.wait_ready(1.0)                 # ready -> only now choose WHICH frame to send
+                    if has_poll:
+                        dac.wait_ready(1.0, poll_s=0.001)   # ready -> only now choose WHICH frame to send
+                    else:
+                        dac.wait_ready(1.0)
             except Exception as e:
-                self._fail(str(e))
+                if not survive(e):
+                    self._fail(str(e))
                 continue
             with self._mb_lock:
                 seq, pts, built = self._mb
@@ -304,7 +361,7 @@ class LaserEngine:
                         dac.stop()
                     except Exception as e:
                         self._fail(str(e))
-                    dark = True
+                    dark, busy_until = True, 0.0
                     if pts is not None:                 # (an empty mailbox is a refusal or start-up, counted elsewhere)
                         with self._lock:
                             self._s["dark"] += 1
@@ -317,9 +374,13 @@ class LaserEngine:
                 else:
                     dac.write(pts, self.pps)            # (test doubles: write itself blocks for pacing)
             except Exception as e:
-                self._fail(str(e))
+                if not survive(e):
+                    self._fail(str(e))
                 continue
-            dark, last_sent = False, seq
+            now2 = time.monotonic()
+            last_dur = len(pts) / float(self.pps)
+            busy_until = max(now2, busy_until) + last_dur
+            err_since, dark, last_sent = 0.0, False, seq
             self._taken.set()
             with self._lock:
                 self._s["sent"] += 1
@@ -342,8 +403,10 @@ class LaserEngine:
                 if c["armed"] and self.auto_disarm_s and now - c["activity"] > self.auto_disarm_s:
                     self._disarm_locked("auto-disarm after inactivity")
                     c["armed"] = False
+            p0 = time.perf_counter()
             try:
                 pods = self._pods(c["source"], now - t0)
+                p1 = time.perf_counter()
                 view = replace(self.base_view, size=c["size"], intensity=min(c["intensity"], self.max_intensity))
                 online = [p for p in pods if p.online]
                 measured = effective = 0.0
@@ -366,8 +429,11 @@ class LaserEngine:
                     fn, _anim, _desc = P.PATTERNS[c["name"]]
                     effective = c["sync"]
                     strokes = fn(now - pat_t0, {"bpm": self.bpm, "sync": c["sync"], "sync_demo": False})
+                p2 = time.perf_counter()
                 fr = P.render(strokes, view, self.pps, self.frame_ms, self.cal)
+                p3 = time.perf_counter()
                 P.validate(fr, view.intensity)
+                p4 = time.perf_counter()
             except P.UnsafeFrame as e:
                 self._invalidate()
                 with self._lock:
@@ -388,8 +454,11 @@ class LaserEngine:
                 pts = P.to_dac(fr)
                 extent = V.lit_extent(strokes, view)
                 peak = (max(p[2] for p in pts), max(p[3] for p in pts), max(p[4] for p in pts))
+                p5 = time.perf_counter()
                 self._publish(pts)
                 self._offer(pts)
+                p6 = time.perf_counter()
+                self._stage_hist.append((p1 - p0, p2 - p1, p3 - p2, p4 - p3, p5 - p4, p6 - p5))
                 built = time.monotonic() - now               # how long the computer needed for this frame
                 self._build_hist.append(built)
                 period = fr.duration_ms / 1000.0

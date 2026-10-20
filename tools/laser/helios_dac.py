@@ -54,6 +54,29 @@ class NoDeviceError(HeliosError):
     pass
 
 
+# libusb error codes (the SDK reports them as -5000 + code). A TIMEOUT / BUSY / INTERRUPTED / PIPE / IO / OVERFLOW answer is
+# the normal result of a busy or slow host (a Raspberry Pi 3 under load): the next attempt usually works. NO_DEVICE,
+# ACCESS, NOT_FOUND, NO_MEM, NOT_SUPPORTED are not worth retrying.
+_TRANSIENT_LIBUSB = {-1: "I/O error", -6: "busy", -7: "timeout", -8: "overflow", -9: "pipe error", -10: "interrupted"}
+
+
+class HeliosUsbError(HeliosError):
+    """A failed USB transfer. .code is the libusb code (e.g. -7 = timeout); .transient says whether retrying makes sense."""
+
+    def __init__(self, message: str, code: int, transient: bool) -> None:
+        super().__init__(message)
+        self.code, self.transient = code, transient
+
+
+def usb_error(what: str, rc: int) -> HeliosError:
+    """Build the right exception for a negative SDK return value."""
+    msg = f"{what}: {describe_error(rc)} ({rc})" if what.startswith("WriteFrame") else f"{what}: {describe_error(rc)}"
+    if rc <= -5000:
+        lib = rc + 5000
+        return HeliosUsbError(msg, lib, lib in _TRANSIENT_LIBUSB)
+    return HeliosError(msg)
+
+
 class HeliosPoint(ctypes.Structure):
     _fields_ = [("x", ctypes.c_uint16), ("y", ctypes.c_uint16),
                 ("r", ctypes.c_uint8), ("g", ctypes.c_uint8), ("b", ctypes.c_uint8),
@@ -230,7 +253,7 @@ class HeliosDAC:
                                   ctypes.cast(arr, ctypes.POINTER(HeliosPoint)), n)
         self._t_write.append(time.perf_counter() - t0)
         if rc != 1:
-            raise HeliosError(f"WriteFrame failed: {describe_error(rc)} ({rc})")
+            raise usb_error("WriteFrame failed", rc)
 
     def wait_ready(self, timeout: float = 1.0, poll_s: float = 0.0005) -> None:
         """Block until the DAC can take another frame. Separate from write() so a caller can choose WHICH frame
@@ -246,7 +269,7 @@ class HeliosDAC:
             if st == 1:
                 break
             if st < 0:
-                raise HeliosError(f"GetStatus failed: {describe_error(st)}")
+                raise usb_error("GetStatus failed", st)
             if time.monotonic() > deadline:
                 raise HeliosError("timed out waiting for the DAC to become ready")
             time.sleep(poll_s)

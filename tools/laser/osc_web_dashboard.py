@@ -45,6 +45,7 @@ import argparse
 import ipaddress
 import logging
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -56,7 +57,7 @@ from dataclasses import dataclass, field
 
 from flask import Flask, Response, abort, jsonify, request, send_file
 from pythonosc.dispatcher import Dispatcher
-from pythonosc.osc_server import ThreadingOSCUDPServer
+from pythonosc.osc_server import BlockingOSCUDPServer
 
 # Chart.js is served from a copy next to this script. There is deliberately
 # NO CDN fallback: this has to work with no internet (a Pi running its own
@@ -233,8 +234,10 @@ class Dashboard:
     def run_osc_server(self) -> None:
         disp = Dispatcher()
         disp.set_default_handler(self.on_message, needs_reply_address=True)
-        server = ThreadingOSCUDPServer(("0.0.0.0", self.osc_port), disp)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        # ONE thread receives every datagram in turn (the handler only updates a dict). The threading server made a new
+        # thread per datagram -- ~450 a second with six pods -- which cost 2.6-2.9x the CPU on an x86 core, far more on a Pi.
+        server = BlockingOSCUDPServer(("0.0.0.0", self.osc_port), disp)
+        threading.Thread(target=server.serve_forever, daemon=True, name="osc").start()
 
 
 # ---------------------------------------------------------------------------
@@ -289,8 +292,8 @@ PAGE = r"""<!doctype html>
   .vbtn { position:absolute; right:8px; top:8px; height:28px; padding:0 10px; border-radius:8px; font-size:11px; font-weight:800;
           background:#262a31; border:1px solid var(--line); color:var(--dim); }
   .vbtn.on { background:#33507a; color:#fff; border-color:var(--acc); }
-  .vinfo { position:absolute; left:8px; bottom:6px; font-size:10px; color:var(--dim); font-variant-numeric:tabular-nums; }
-  .vmsg { position:absolute; left:8px; right:8px; bottom:24px; text-align:center; font-size:11px; color:var(--warn); }
+  .vinfo { position:absolute; left:8px; bottom:6px; max-width:calc(100% - 150px); font-size:10px; line-height:1.35; white-space:pre-wrap; color:var(--dim); font-variant-numeric:tabular-nums; }
+  .vmsg { position:absolute; left:8px; right:8px; bottom:38px; text-align:center; font-size:11px; color:var(--warn); }
   .vblack { position:absolute; right:8px; bottom:8px; height:44px; padding:0 16px; border-radius:10px; font-size:15px;
             font-weight:900; letter-spacing:.06em; background:#b02020; border:2px solid #ff8a8a; color:#fff; }
   .voff { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center;
@@ -635,7 +638,7 @@ async function poll() {
 
 // ---- laser visualiser: draws the frames the engine sends to the DAC -------------
 const cv = $('viz'), ctx = cv.getContext('2d');
-let lstate = null, engineOn = true, zoomOn = false, vizSeq = 0, vizRunning = false, lastFrameAt = 0;
+let lstate = null, engineOn = true, zoomOn = false, vizSeq = 0, vizRunning = false, lastFrameAt = 0, vizMs = 33;
 
 function sizeCanvas() {
   const r = cv.getBoundingClientRect();
@@ -685,6 +688,7 @@ async function vizLoop() {
   if (vizRunning) return;
   vizRunning = true;
   while (view === 'main' && engineOn) {
+    const t0 = performance.now();
     try {
       const r = await fetch('/api/laser/frame.bin?since=' + vizSeq, { cache: 'no-store' });
       if (r.status === 200) {
@@ -693,6 +697,8 @@ async function vizLoop() {
         lastFrameAt = performance.now();
       } else if (r.status !== 204) { await sleep(500); }
     } catch (e) { await sleep(500); }
+    const spare = vizMs - (performance.now() - t0);      // the laser has priority over the screen: never draw more often than the hub says
+    if (spare > 2) await sleep(spare);
   }
   vizRunning = false;
 }
@@ -839,13 +845,22 @@ function renderLaser(s) {
   $('btn-black').disabled = !s.laser || !s.can_control;
   $('panel-laser').classList.toggle('ro', !s.can_control);
   renderArm();
-  let info = s.points + ' pts  ' + s.frame_ms + ' ms  ' + s.fps + ' fps';
-  if (s.laser && s.mode === 'armed') info += '  late ' + s.late;
-  if (s.refused) info += '  refused ' + s.refused;
-  info += '  pods ' + s.pods_online + '/6 (live ' + s.pods_live + ')';
-  $('v-info').textContent = info;
+  // load = how much of each frame period the computer spends BUILDING a frame (100% = cannot keep up);
+  // sent = frames handed to the DAC so far (must keep rising while armed); rep = frames re-sent because the next one was not ready;
+  // dark = times output stopped for lack of frames
+  vizMs = s.viz_ms || 33;
+  let l1 = s.points + ' pts  ' + s.frame_ms + ' ms  ' + s.fps + ' fps  load ' + Math.round(100 * (s.load || 0)) + '%';
+  if (s.laser && s.mode === 'armed') l1 += '  sent ' + (s.sent || 0) + '  rep ' + (s.late || 0) + (s.dark ? '  dark ' + s.dark : '');
+  if (s.usb_errors) l1 += '  usb err ' + s.usb_errors;
+  if (s.refused) l1 += '  refused ' + s.refused;
+  // ext = how wide the lit pattern really is (full field = 2.0); (xN) = enlarged to keep it above --min-extent;
+  // rgb = peak 8-bit drive of each colour channel in the last frame
+  const l2 = 'ext ' + (s.extent || 0).toFixed(2) + (s.boost > 1.01 ? ' (x' + s.boost.toFixed(1) + ')' : '') +
+             '  rgb ' + (s.peak_rgb || []).join('/') + '  pods ' + s.pods_online + '/6 live ' + s.pods_live;
+  $('v-info').textContent = l1 + '\n' + l2;
   if (!s.can_control) $('v-msg').textContent = 'view only: controls work from the hub\'s own screen';
   else if (s.error) $('v-msg').textContent = s.error;
+  else if (s.last_refusal && s.refusal_age_s != null && s.refusal_age_s < 5) $('v-msg').textContent = 'no picture: ' + s.last_refusal;
   else if (s.mode === 'safe' && s.note && /auto-disarm|blackout|error/.test(s.note)) $('v-msg').textContent = s.note;
   else if (!msgTimer || !$('v-msg').textContent.startsWith('control')) { if (s.can_control && !s.error) $('v-msg').textContent = ''; }
 }
@@ -871,7 +886,7 @@ $('back').addEventListener('click', closeDetail);
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && view === 'detail') closeDetail(); });
 document.addEventListener('contextmenu', e => e.preventDefault());
 
-window.cosmicDebug = () => ({ vizSeq: vizSeq, lastFrameAt: lastFrameAt, tab: tab, view: view });   // for tests
+window.cosmicDebug = () => ({ vizSeq: vizSeq, lastFrameAt: lastFrameAt, tab: tab, view: view, renderLaser: renderLaser });   // for tests
 sizeCanvas();
 loadInfo();
 poll();
@@ -1003,6 +1018,19 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--max-size", type=float, default=0.6, help="the SIZE slider's ceiling (default 0.6)")
     g.add_argument("--auto-disarm", type=float, default=20.0, metavar="MIN",
                    help="disarm after this many minutes without any control activity (default 20; 0 = never)")
+    g.add_argument("--max-stale-ms", type=int, default=200, metavar="MS",
+                   help="with --laser: if no NEW frame has been built for this long while armed, the DAC is stopped (dark) "
+                        "instead of repeating the last frame (default 200; a slow computer re-sends the last frame "
+                        "to keep the laser lit, a stalled one goes dark)")
+    g.add_argument("--usb-grace-ms", type=int, default=1000, metavar="MS",
+                   help="with --laser: transient USB errors (a timeout, 'libusb error -7') are ridden out for this long before the "
+                        "laser is disarmed with an error (default 1000)")
+    g.add_argument("--viz-fps", type=float, default=30.0, metavar="FPS",
+                   help="ceiling for the on-screen visualiser's frame rate (default 30; ~15 saves a Raspberry Pi's browser a lot of "
+                        "work). It also slows down by itself when the hub is overloaded")
+    g.add_argument("--perf", nargs="?", const=5.0, type=float, default=None, metavar="SECONDS",
+                   help="print every SECONDS (default 5) where the CPU goes: per thread, per stage of a frame, and the board's clock "
+                        "and throttling. Run it on the Pi and send me the lines")
     g.add_argument("--allow-high", action="store_true", help="permit --max-intensity above 0.5")
     g.add_argument("--allow-remote-control", action="store_true",
                    help="with --laser, accept control (incl. ARM) from other machines too. DANGEROUS on an open hotspot")
@@ -1013,12 +1041,74 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def start_perf_reporter(engine, interval: float) -> None:
+    """--perf: every `interval` seconds print where the CPU goes (per thread), where a frame's time goes, and the board's
+    clock / throttling. For finding out WHAT makes a slow computer (a Raspberry Pi 3) fall behind."""
+    def thread_cpu():                                           # CPU seconds per named thread (Linux)
+        out = {}
+        try:
+            tick = os.sysconf("SC_CLK_TCK")
+            for t in threading.enumerate():
+                tid = getattr(t, "native_id", None)
+                if tid:
+                    with open(f"/proc/self/task/{tid}/stat") as f:
+                        p = f.read().rsplit(") ", 1)[1].split()
+                    out[t.name] = out.get(t.name, 0.0) + (int(p[11]) + int(p[12])) / tick
+        except (OSError, ValueError, AttributeError, IndexError):
+            return None
+        return out
+
+    def board() -> str:
+        bits = []
+        try:
+            mhz = int(open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq").read()) // 1000
+            gov = open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").read().strip()
+            bits.append(f"cpu {mhz} MHz ({gov})")
+        except (OSError, ValueError):
+            pass
+        if shutil.which("vcgencmd"):
+            for what, key in (("get_throttled", "throttled"), ("measure_temp", "temp")):
+                try:
+                    out = subprocess.run(["vcgencmd", what], capture_output=True, text=True, timeout=1).stdout.strip()
+                    bits.append(out.split("=", 1)[-1] if what == "measure_temp" else out.replace("throttled=", "throttled "))
+                except Exception:
+                    pass
+        return "  ".join(bits)
+
+    def loop() -> None:
+        t0, c0, th0, s0 = time.monotonic(), time.process_time(), thread_cpu(), engine.state()
+        while True:
+            time.sleep(interval)
+            t1, c1, th1, s1 = time.monotonic(), time.process_time(), thread_cpu(), engine.state()
+            dt = t1 - t0
+            parts = [f"process {100 * (c1 - c0) / dt:.0f}%"]
+            if th0 is not None and th1 is not None:
+                named = 0.0
+                for label, key in (("engine", "laser-engine"), ("dac", "laser-dac"), ("osc", "osc")):
+                    v = 100 * (th1.get(key, 0.0) - th0.get(key, 0.0)) / dt
+                    named += v
+                    parts.append(f"{label} {v:.0f}%")
+                parts.append(f"web+other {100 * (c1 - c0) / dt - named:.0f}%")
+            st = s1["stages"]
+            frame = " + ".join(f"{k} {v:g}" for k, v in st.items())
+            line = (f"[perf {interval:g}s] CPU (% of one core): " + " | ".join(parts) +
+                    f"  ||  one frame: {s1['build_ms']:.1f} ms = {frame}  (load {100 * s1['load']:.0f}% of a {s1['frame_ms']:.0f} ms period)"
+                    f"  ||  frames/s sent {(s1['sent'] - s0['sent']) / dt:.0f}, re-sent {(s1['late'] - s0['late']) / dt:.0f}, "
+                    f"dark {s1['dark']}, usb errors {s1['usb_errors']}")
+            b = board()
+            print(line + (f"  ||  {b}" if b else ""), flush=True)
+            t0, c0, th0, s0 = t1, c1, th1, s1
+
+    threading.Thread(target=loop, daemon=True, name="perf").start()
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if LT is not None:
         LT.check_args(args)            # exits 2 with a message on a bad shared option
     if args.laser and LT is None:
-        print(f"error: --laser needs the laser/ folder next to this file ({LASER_IMPORT_ERROR})", file=sys.stderr)
+        print(f"error: --laser cannot start, the laser code did not load: {LASER_IMPORT_ERROR}\n"
+              f"       (the laser/ folder must sit next to this file, and its files must all be from the same update)", file=sys.stderr)
         return 3
     if LT is not None:
         errs = []
@@ -1034,6 +1124,12 @@ def main(argv=None) -> int:
             errs.append(f"--scene must be one of: {', '.join(LV.SCENES)}")
         if args.auto_disarm < 0:
             errs.append("--auto-disarm cannot be negative")
+        if not 50 <= args.max_stale_ms <= 2000:
+            errs.append("--max-stale-ms must be 50-2000")
+        if not 100 <= args.usb_grace_ms <= 10000:
+            errs.append("--usb-grace-ms must be 100-10000")
+        if not 2 <= args.viz_fps <= 60:
+            errs.append("--viz-fps must be 2-60")
         if errs:
             print("error: " + "; ".join(errs), file=sys.stderr)
             return 2
@@ -1054,8 +1150,20 @@ def main(argv=None) -> int:
             args.pps, args.frame_ms, LP.PALETTES[args.palette], dac=dac, source=args.source, scene=args.scene,
             sync=args.sync if args.sync is not None else 0.0, sync_mode="hold" if args.sync is not None else "auto",
             max_intensity=args.max_intensity, max_size=args.max_size, auto_disarm_s=args.auto_disarm * 60.0,
-            bpm=args.bpm, tol_bpm=args.tol_bpm, demo_speed=args.demo_speed)
+            bpm=args.bpm, tol_bpm=args.tol_bpm, demo_speed=args.demo_speed, min_extent=args.min_extent,
+            max_stale_s=args.max_stale_ms / 1000.0, usb_grace_s=args.usb_grace_ms / 1000.0, viz_fps=args.viz_fps)
         engine.start()
+
+        def _selfcheck() -> None:                                # a dashboard that is quietly blank is the worst failure
+            st = engine.state()
+            if st["frames"] == 0:
+                print(f"\nWARNING: the laser engine has produced NO frames after 2.5 s. Last problem: "
+                      f"{st['last_refusal'] or '(none recorded)'}\n         The picture will be blank and nothing can reach the laser.", file=sys.stderr)
+        _t = threading.Timer(2.5, _selfcheck)
+        _t.daemon = True
+        _t.start()
+        if args.perf:
+            start_perf_reporter(engine, max(1.0, args.perf))
 
     local_ips = get_local_ips()
     have_chart = os.path.exists(CHART_JS_FILE)
@@ -1067,6 +1175,9 @@ def main(argv=None) -> int:
     if not have_chart:
         print(f"\nNOTE: {CHART_JS_FILE} not found -- the graphs will be unavailable "
               "(no CDN fallback, by design: this must work offline). Tiles and numbers still work.")
+    if engine is not None:
+        if args.min_extent > 0:
+            print(f"Scenes never get narrower than {args.min_extent:g} (lit width, full field = 2.0; --min-extent, 0 = off).")
     if engine is None:
         print(f"\nNOTE: laser engine not loaded ({LASER_IMPORT_ERROR}) -- no visualiser, no controls.")
     elif dac is None:
@@ -1075,6 +1186,7 @@ def main(argv=None) -> int:
         print(f"\nLASER: DAC {dac.name or '(unnamed)'} firmware {dac.firmware} open, output SAFE (dark). "
               f"ARM on the touch screen. Limits: LEVEL <= {args.max_intensity}, SIZE <= {args.max_size}; "
               f"auto-disarm {'off' if not args.auto_disarm else f'after {args.auto_disarm:g} min'}; "
+              f"dark if no new frame for {args.max_stale_ms} ms; USB errors ridden out for {args.usb_grace_ms} ms; "
               f"controls from {'ANY machine (!)' if args.allow_remote_control else 'this machine only'}.")
 
     app = build_app(dashboard, engine, local_ips, have_chart, args.osc_port, args.allow_remote_control)
