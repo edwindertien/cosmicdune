@@ -113,6 +113,9 @@ def add_view_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--intensity", type=float, default=0.15,
                    help="colour level, 1.0 = full analog level (default 0.15; >0.5 needs --allow-high)")
     g.add_argument("--pps", type=int, default=20000, help="points per second (5000-60000, default 20000)")
+    g.add_argument("--min-extent", type=float, default=0.0,
+                   help="scenes never get narrower than this lit width (full field = 2.0 wide); smaller moments are "
+                        "enlarged. Default 0 = off (0.2 is a reasonable start). Scenes only, not the test patterns")
     g.add_argument("--frame-ms", type=float, default=30.0, help="target frame length, 12-50 ms (default 30)")
     g = p.add_argument_group("orientation (use the 'orient' pattern to find these)")
     g.add_argument("--rotate", type=float, default=0.0, help="degrees")
@@ -171,6 +174,8 @@ def check_args(args) -> None:
         errs.append("--travel-step must be 0.01-0.12")
     if args.sync is not None and not 0.0 <= args.sync <= 1.0:
         errs.append("--sync must be 0-1")
+    if not 0.0 <= args.min_extent <= 1.0:
+        errs.append("--min-extent must be 0-1 (0 = off)")
     if not 0.05 <= args.size <= 1.0:
         errs.append("--size must be 0.05-1.0")
     if not 0.0 < args.intensity <= 1.0:
@@ -259,7 +264,9 @@ def cmd_check(args) -> int:
                     continue
                 try:
                     t0 = time.perf_counter()
-                    fr = P.render(sc.strokes(pods), view, args.pps, args.frame_ms, cal)
+                    strokes = sc.strokes(pods)
+                    v2, _b = V.fit_min_extent(strokes, view, args.min_extent)
+                    fr = P.render(strokes, v2, args.pps, args.frame_ms, cal)
                     P.validate(fr, view.intensity)
                     rt.append((time.perf_counter() - t0) * 1000.0)
                     npts.append(len(fr.points))
@@ -283,7 +290,9 @@ def _scene_frame(name: str, sync: float, t: float, view: P.View, args, demo_spee
     palette = P.PALETTES.get(getattr(args, "palette", "gsr"), P.gradient)
     sc = V.SCENES[name](V.scene_min_r(args.size), palette)
     pods, _eff, _m = V.simulate(sc, V.DemoInputs(demo_speed), None, max(t, 0.1), fixed_sync=sync)
-    fr = P.render(sc.strokes(pods), view, args.pps, args.frame_ms, cal)
+    strokes = sc.strokes(pods)
+    v2, _b = V.fit_min_extent(strokes, view, args.min_extent)
+    fr = P.render(strokes, v2, args.pps, args.frame_ms, cal)
     P.validate(fr, view.intensity)
     return fr
 
@@ -484,7 +493,9 @@ def show_session(args) -> int:
                 t += 1 / 30.0
                 pods = demo.pods(t)
                 sc.update(1 / 30.0, pods, sy)
-                P.validate(P.render(sc.strokes(pods), view, args.pps, args.frame_ms, cal), view.intensity)
+                strokes = sc.strokes(pods)
+                v2, _b = V.fit_min_extent(strokes, view, args.min_extent)
+                P.validate(P.render(strokes, v2, args.pps, args.frame_ms, cal), view.intensity)
     print(f"{args.scene}: pre-flight passed for all scenes (sync 0 / 0.5 / 1).")
     if args.osc_port and args.dashboard:
         print("error: use --osc-port OR --dashboard, not both", file=sys.stderr)
@@ -561,7 +572,9 @@ def show_session(args) -> int:
                 time.sleep(0.03)
             else:
                 try:
-                    fr = P.render(scene.strokes(pods), view, args.pps, args.frame_ms, cal)
+                    strokes = scene.strokes(pods)
+                    v2, _b = V.fit_min_extent(strokes, view, args.min_extent)
+                    fr = P.render(strokes, v2, args.pps, args.frame_ms, cal)
                     P.validate(fr, view.intensity)
                     run_refused = 0
                 except P.UnsafeFrame:
@@ -620,6 +633,100 @@ def cmd_cycle(args) -> int:
     return session(args, names, args.each)
 
 
+def _machine_line() -> str:
+    import platform
+    parts = [f"{platform.system()} {platform.machine()}", f"Python {platform.python_version()}", f"{os.cpu_count()} cores"]
+    try:
+        parts.append("load avg " + "/".join(f"{x:.1f}" for x in os.getloadavg()))
+    except (AttributeError, OSError):
+        pass
+    try:                                                    # Raspberry Pi: has the board been throttled (undervoltage / heat)?
+        import shutil, subprocess
+        if shutil.which("vcgencmd"):
+            out = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True, text=True, timeout=2).stdout.strip()
+            parts.append(out.replace("throttled=", "throttled ") + " (0x0 = never throttled)")
+    except Exception:
+        pass
+    return ", ".join(parts)
+
+
+def cmd_bench(args) -> int:
+    """Measure whether this computer can feed the DAC: the hub's real pipeline, colours forced to ZERO (nothing is emitted)."""
+    import engine as E
+    check_args(args)
+    if args.scene not in V.SCENES:
+        print(f"unknown scene {args.scene!r}; try `list`", file=sys.stderr)
+        return EXIT_USAGE
+    view, cal = view_from(args), calib_from(args)
+    dac = open_dac(args)
+    eng = E.LaserEngine(lambda: {}, view, cal, args.pps, args.frame_ms, P.PALETTES[args.palette], dac=dac, source="demo",
+                        scene=args.scene, sync=args.sync if args.sync is not None else 0.5, sync_mode="hold",
+                        max_intensity=0.0,                  # the engine clamps every colour to 0: the beam cannot light
+                        auto_disarm_s=0, min_extent=args.min_extent)
+    try:
+        print(f"bench: scene {args.scene}, six simulated pods, {args.seconds:g} s measured, pps {args.pps}, frame {args.frame_ms:g} ms")
+        print("       output is DARK: colours are forced to zero, the mirrors move but nothing is emitted.")
+        print(f"machine: {_machine_line()}")
+        print(f"DAC    : {dac.name or '(unnamed)'}  ({dac.lib_path})")
+        eng.start()
+        time.sleep(0.5)
+        ok, msg = eng.control({"arm": True})
+        if not ok:
+            print(f"error: {msg}", file=sys.stderr)
+            return EXIT_DEVICE
+        time.sleep(2.0)                                     # warm-up: caches, first USB transfers
+        s0, c0, w0 = eng.state(), time.process_time(), time.monotonic()
+        end = w0 + args.seconds
+        while time.monotonic() < end:
+            time.sleep(0.25)
+            st = eng.state()
+            if st["mode"] == "error":
+                print(f"\nDAC error during the run: {st['error']}", file=sys.stderr)
+                return EXIT_DEVICE
+            if any(st["peak_rgb"]):
+                print("\nABORT: a frame carried colour although the bench forces zero. Nothing was emitted by design, but stopping.", file=sys.stderr)
+                return EXIT_UNSAFE
+        s1, c1, w1 = eng.state(), time.process_time(), time.monotonic()
+    finally:
+        eng.shutdown()                                      # Stop + shutter closed + close
+    wall = w1 - w0
+    built, sent = s1["frames"] - s0["frames"], s1["sent"] - s0["sent"]
+    late, dark = s1["late"] - s0["late"], s1["dark"] - s0["dark"]
+    period = s1["frame_ms"]
+    usb = s1.get("usb") or {}
+    print()
+    print(f"frame period          {period:6.1f} ms   ({s1['points']} points)")
+    print(f"building one frame    {s1['build_ms']:6.1f} ms avg   {s1['build_max_ms']:5.1f} ms worst   -> load {100 * s1['load']:.0f} % of the period"
+          f"{'   <-- cannot keep up' if s1['load'] >= 1.0 else ''}")
+    print(f"frames built / s      {built / wall:6.1f}")
+    print(f"frames sent / s       {sent / wall:6.1f}    re-sent because none was ready: {late} ({100.0 * late / max(1, sent):.1f} %)    dark events: {dark}")
+    if usb:
+        print(f"USB (per frame)       waiting for ready {usb['ready_ms']:5.1f} ms avg ({usb['polls']:.0f} polls), "
+              f"WriteFrame {usb['write_ms']:4.1f} ms avg / {usb['write_max_ms']:.1f} ms worst")
+    print(f"this process' CPU     {100.0 * (c1 - c0) / wall:6.0f} %  of one core (all threads together)")
+    print()
+    repeat_pct = 100.0 * late / max(1, sent)
+    if dark == 0 and repeat_pct < 2.0:
+        print("VERDICT: keeps up. Frames reach the DAC on time; the laser would stay lit with a smooth animation.")
+    else:
+        why = []
+        if s1["load"] >= 0.7:
+            why.append(f"the computer needs {s1['build_ms']:.0f} ms to build a {period:.0f} ms frame (load {100 * s1['load']:.0f} %) -- CPU-bound")
+        if usb and usb["write_max_ms"] > 0.6 * period:
+            why.append(f"a USB write took up to {usb['write_max_ms']:.0f} ms of a {period:.0f} ms frame -- the USB path is slow")
+        if s1["build_max_ms"] > 0.9 * period and s1["load"] < 0.7:
+            why.append(f"most frames build quickly, but the slowest took {s1['build_max_ms']:.0f} ms (a frame lasts {period:.0f} ms): "
+                       "other programs, the browser or throttling steal CPU time in bursts")
+        if not why:
+            why.append("building is fast and USB is quick, so something else is delaying the threads (other programs, the browser, throttling)")
+        print(f"VERDICT: does NOT keep up -- {100.0 * late / max(1, sent):.0f} % of the slots re-sent the previous frame"
+              f"{f', and output went dark {dark} time(s)' if dark else ''}.")
+        for w in why:
+            print(f"  - {w}")
+        print("  Try: --pps 15000 (fewer points), close the browser/other programs, `nice -n -5`, a cooler/stronger supply (check throttled above).")
+    return 0
+
+
 # ---- main -------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -671,6 +778,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_view_args(p)
     add_run_args(p)
     p.set_defaults(fn=cmd_show)
+
+    p = sub.add_parser("bench", help="can this computer feed the DAC? (output stays DARK; run it on the Mac and on the Pi)")
+    p.add_argument("scene", nargs="?", default="converge", help="the scene to build (default converge, the heaviest)")
+    p.add_argument("--seconds", type=float, default=15.0, help="measuring time after a 2 s warm-up (default 15)")
+    p.add_argument("--palette", choices=sorted(P.PALETTES), default="gsr")
+    p.add_argument("--dry-run", action="store_true", help="no DAC at all: measures only the computer")
+    p.add_argument("--lib", help="path to the Helios library (or set $HELIOS_LIB)")
+    p.add_argument("--device", type=int, default=0, help="DAC number if several are connected")
+    add_view_args(p)
+    p.set_defaults(fn=cmd_bench)
 
     p = sub.add_parser("cycle", help="run through the patterns")
     p.add_argument("--each", type=float, default=8.0, help="seconds per pattern (default 8)")

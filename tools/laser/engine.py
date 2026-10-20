@@ -6,8 +6,15 @@ This is the piece that makes the on-screen visualiser TRUSTWORTHY: the browser i
 same (x12, y12, r8, g8, b8) points that are handed to the DAC, after calibration (orientation,
 --rgb-min, blank shift ...), not a re-drawing of what the pattern was meant to look like.
 
-THREADS AND THE DAC. One thread (the engine's) makes every call into the DAC: write, stop, close.
-Web handlers only set flags under a lock and the engine acts on them within one frame (~30 ms).
+THREADS AND THE DAC. Two engine threads, with a strict split of duties:
+  * the PRODUCER builds frames (pods -> scene -> render -> validate), publishes them to the browser and
+    leaves the newest one in a one-slot mailbox. It never touches the DAC.
+  * the WRITER is the only thread that calls the DAC (wait, write, stop) until shutdown closes it. At the
+    moment the DAC is ready it sends the NEWEST frame; if the producer has not delivered a newer one (a slow
+    computer, e.g. a Raspberry Pi 3) it re-sends the last one, so the DAC is never starved and the laser
+    does not flicker dark -- only the animation steps. If NO new frame has arrived for max_stale_s the
+    writer stops the DAC: a stalled producer means dark, never a frozen picture.
+Web handlers only set flags under a lock; the writer acts on them within one frame (~30 ms).
 (The Helios library is not documented as thread-safe, so nothing else touches it.)
 
 SAFETY MODEL
@@ -17,12 +24,13 @@ SAFETY MODEL
   * The operator-adjustable limits are enforced HERE, not in the browser: intensity is clamped to
     max_intensity and size to max_size whatever a client asks for.
   * Auto-disarm after auto_disarm_s without any control activity (0 = never).
-  * Every frame still goes through patterns.validate(); a refused frame is simply not sent
-    (SINGLE_MODE: no frames -> the laser turns itself off).
+  * Every frame still goes through patterns.validate(); a refused frame is never sent and the mailbox is
+    emptied, so the writer goes dark at once (SINGLE_MODE: no frames -> the laser turns itself off).
   * A DAC error disarms and latches an error; the engine keeps previewing.
 """
 from __future__ import annotations
 
+import collections
 import struct
 import threading
 import time
@@ -56,12 +64,21 @@ class LaserEngine:
                  palette: Callable[[float], P.Color] = P.gradient, *, dac=None, source: str = "demo",
                  scene: str = "converge", sync: float = 0.0, sync_mode: str = "auto",
                  max_intensity: float = 0.3, max_size: float = 0.6, auto_disarm_s: float = 1200.0,
-                 bpm: float = 72.0, tol_bpm: float = 10.0, demo_speed: float = 1.0) -> None:
+                 bpm: float = 72.0, tol_bpm: float = 10.0, demo_speed: float = 1.0,
+                 min_extent: float = 0.0, max_stale_s: float = 0.2) -> None:
         self.summary_fn, self.base_view, self.cal = summary_fn, view, cal
         self.pps, self.frame_ms, self.palette = pps, frame_ms, palette
         self.dac = dac
         self.max_intensity, self.max_size = max_intensity, max_size
         self.auto_disarm_s, self.bpm, self.tol_bpm = auto_disarm_s, bpm, tol_bpm
+        self.min_extent = max(0.0, float(min_extent))     # scenes never get narrower than this (field units); 0 = off
+        self.max_stale_s = max(0.05, float(max_stale_s))  # no new frame for this long while armed -> the writer goes dark
+        self.dac_ok = dac is not None
+        self._mb_lock = threading.Lock()
+        self._mb: Tuple[int, Optional[List], float] = (0, None, 0.0)   # newest frame for the writer: (seq, points, built at)
+        self._taken = threading.Event()                   # the writer sets it each time it sent a frame (paces the producer)
+        self._wthread: Optional[threading.Thread] = None
+        self._build_hist: collections.deque = collections.deque(maxlen=60)
         self._demo = V.DemoInputs(demo_speed)
         self._lock = threading.Lock()
         self._cond = threading.Condition()
@@ -79,7 +96,9 @@ class LaserEngine:
         self._seq = 0
         self._frame: Tuple[int, bytes] = (0, b"")
         self._s = {"frames": 0, "late": 0, "refused": 0, "points": 0, "frame_ms": 0.0, "fps": 0.0,
-                   "measured": 0.0, "effective": 0.0, "live": 0, "online": 0, "last_refusal": ""}
+                   "measured": 0.0, "effective": 0.0, "live": 0, "online": 0, "last_refusal": "",
+                   "extent": 0.0, "boost": 1.0, "peak_rgb": (0, 0, 0),
+                   "dark": 0, "sent": 0, "build_ms": 0.0, "build_max_ms": 0.0, "load": 0.0}
 
     # ------------------------------------------------------------------ controls
     def control(self, patch: Dict) -> Tuple[bool, str]:
@@ -153,6 +172,11 @@ class LaserEngine:
             "pods_online": s["online"], "pods_live": s["live"],
             "frames": s["frames"], "late": s["late"], "refused": s["refused"], "last_refusal": s["last_refusal"],
             "points": s["points"], "frame_ms": round(s["frame_ms"], 1), "fps": round(s["fps"], 1), "seq": seq,
+            "min_extent": self.min_extent, "extent": round(s["extent"], 3), "boost": round(s["boost"], 2),
+            "peak_rgb": list(s["peak_rgb"]),
+            "dark": s["dark"], "sent": s["sent"], "build_ms": round(s["build_ms"], 1),
+            "build_max_ms": round(s["build_max_ms"], 1), "load": round(s["load"], 2),
+            "max_stale_ms": int(self.max_stale_s * 1000), "usb": self._usb_stats(),
             "armed_for_s": round(now - arm_time, 1) if c["armed"] else None,
             "auto_disarm_in_s": round(remaining, 1) if remaining is not None else None,
             "error": err, "note": note,
@@ -160,6 +184,13 @@ class LaserEngine:
         }
 
     # ------------------------------------------------------------------ frames out
+    def _usb_stats(self) -> Optional[Dict]:
+        fn = getattr(self.dac, "stats", None)
+        try:
+            return fn() if (self.dac is not None and callable(fn)) else None
+        except Exception:
+            return None
+
     def wait_frame(self, since: int, timeout: float = 0.25) -> Optional[Tuple[int, bytes]]:
         """Block (up to timeout) for a frame newer than `since`; None if there is none."""
         deadline = time.monotonic() + timeout
@@ -186,14 +217,20 @@ class LaserEngine:
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="laser-engine", daemon=True)
         self._thread.start()
+        if self.dac is not None:
+            self._wthread = threading.Thread(target=self._dac_loop, name="laser-dac", daemon=True)
+            self._wthread.start()
 
     def shutdown(self) -> None:
         """Stop the thread, then leave the DAC dark (Stop + shutter closed + close)."""
         self._stop.set()
+        self._taken.set()
         if self._thread:
             self._thread.join(timeout=3.0)
+        if self._wthread:
+            self._wthread.join(timeout=3.0)
         if self.dac is not None:
-            self.dac.close()
+            self.dac.close()                 # only after both threads ended: nothing else is using the DAC now
 
     # ------------------------------------------------------------------ the loop
     def _pods(self, source: str, t: float) -> List[V.PodInput]:
@@ -211,33 +248,97 @@ class LaserEngine:
             self._disarm_locked("error")
         self.dac_ok = False
 
+    # ---- hand-over between the two threads ---------------------------------------------------
+    def _offer(self, pts: List[Tuple[int, int, int, int, int]]) -> None:
+        with self._mb_lock:
+            self._mb = (self._seq, pts, time.monotonic())
+
+    def _invalidate(self) -> None:
+        """A refused/failed frame: nothing may be sent until a good one arrives, so the writer goes dark."""
+        with self._mb_lock:
+            self._mb = (self._seq, None, 0.0)
+
+    def _dac_loop(self) -> None:
+        """THE WRITER: the only thread that calls the DAC while the engine runs."""
+        dac = self.dac
+        has_wait = callable(getattr(dac, "wait_ready", None))
+        last_sent = 0
+        dark = False                                    # output currently stopped because frames went missing
+        while not self._stop.is_set():
+            with self._lock:
+                armed = self._c["armed"]
+                stop_now, self._stop_pending = self._stop_pending, False
+            if stop_now:
+                try:
+                    dac.stop()
+                except Exception as e:                  # a failing Stop must not kill the writer
+                    self._fail(str(e))
+                last_sent, dark = 0, False
+            if not armed or not self.dac_ok:
+                self._stop.wait(0.005)
+                continue
+            try:
+                if has_wait:
+                    dac.wait_ready(1.0)                 # ready -> only now choose WHICH frame to send
+            except Exception as e:
+                self._fail(str(e))
+                continue
+            with self._mb_lock:
+                seq, pts, built = self._mb
+            with self._lock:                            # an ARM-off / BLACKOUT that arrived while we waited wins
+                if not self._c["armed"] or self._stop_pending:
+                    continue
+            now = time.monotonic()
+            if pts is None or (seq == last_sent and now - built > self.max_stale_s):
+                if not dark:                            # nothing valid and fresh to show: DARK, not a frozen picture
+                    try:
+                        dac.stop()
+                    except Exception as e:
+                        self._fail(str(e))
+                    dark = True
+                    if pts is not None:                 # (an empty mailbox is a refusal or start-up, counted elsewhere)
+                        with self._lock:
+                            self._s["dark"] += 1
+                self._stop.wait(0.005)
+                continue
+            repeat = seq == last_sent
+            try:
+                if has_wait:
+                    dac.write(pts, self.pps, assume_ready=True)
+                else:
+                    dac.write(pts, self.pps)            # (test doubles: write itself blocks for pacing)
+            except Exception as e:
+                self._fail(str(e))
+                continue
+            dark, last_sent = False, seq
+            self._taken.set()
+            with self._lock:
+                self._s["sent"] += 1
+                if repeat:
+                    self._s["late"] += 1                # re-sent: the producer was too slow for this slot
+
     def _run(self) -> None:
+        """THE PRODUCER: pods + controls -> validated frames -> browser + mailbox. Never touches the DAC."""
         meter = V.SyncMeter(self.tol_bpm)
-        t0 = last = last_write = time.monotonic()
+        t0 = last = time.monotonic()
         scene: Optional[V.Scene] = None
         scene_key = None
         pat_t0 = t0
-        self.dac_ok = self.dac is not None
         while not self._stop.is_set():
             now = time.monotonic()
             dt = min(now - last, 0.1)
             last = now
             with self._lock:
                 c = dict(self._c)
-                stop_now, self._stop_pending = self._stop_pending, False
                 if c["armed"] and self.auto_disarm_s and now - c["activity"] > self.auto_disarm_s:
                     self._disarm_locked("auto-disarm after inactivity")
                     c["armed"] = False
-            if stop_now and self.dac is not None and self.dac_ok:
-                try:
-                    self.dac.stop()
-                except Exception as e:                      # a failing Stop must not kill the engine
-                    self._fail(str(e))
             try:
                 pods = self._pods(c["source"], now - t0)
                 view = replace(self.base_view, size=c["size"], intensity=min(c["intensity"], self.max_intensity))
                 online = [p for p in pods if p.online]
                 measured = effective = 0.0
+                boost = 1.0
                 if c["kind"] == "scene":
                     key = ("scene", c["name"])
                     if key != scene_key:
@@ -247,6 +348,8 @@ class LaserEngine:
                     effective = c["sync"] if c["sync_mode"] == "hold" else V.effective_sync(measured, c["sync"])
                     scene.update(dt, pods, effective)
                     strokes = scene.strokes(pods)
+                    # keep the pattern from shrinking below the floor (only scenes; see visuals.fit_min_extent)
+                    view, boost = V.fit_min_extent(strokes, view, self.min_extent)
                 else:
                     key = ("pattern", c["name"])
                     if key != scene_key:
@@ -257,35 +360,37 @@ class LaserEngine:
                 fr = P.render(strokes, view, self.pps, self.frame_ms, self.cal)
                 P.validate(fr, view.intensity)
             except P.UnsafeFrame as e:
+                self._invalidate()
                 with self._lock:
                     self._s["refused"] += 1
                     self._s["last_refusal"] = str(e)
                 time.sleep(0.02)
                 continue
             except Exception as e:                           # a bug in a pattern must not take the engine down
+                self._invalidate()
                 with self._lock:
                     self._s["refused"] += 1
                     self._s["last_refusal"] = f"{type(e).__name__}: {e}"
                 time.sleep(0.05)
                 continue
             pts = P.to_dac(fr)
+            extent = V.lit_extent(strokes, view)
+            peak = (max(p[2] for p in pts), max(p[3] for p in pts), max(p[4] for p in pts))
             self._publish(pts)
-            sent = False
-            if c["armed"] and self.dac is not None and self.dac_ok:
-                try:
-                    self.dac.write(pts, self.pps)            # blocks until the DAC wants it: real-time pacing
-                    sent = True
-                except Exception as e:
-                    self._fail(str(e))
-            done = time.monotonic()
-            if not sent:                                     # preview / safe: pace like the DAC would
-                time.sleep(max(0.0, min(0.1, fr.duration_ms / 1000.0 - (done - now))))
-                done = time.monotonic()
+            self._offer(pts)
+            built = time.monotonic() - now                   # how long the computer needed for this frame
+            self._build_hist.append(built)
+            period = fr.duration_ms / 1000.0
             with self._lock:
                 s = self._s
                 s["frames"] += 1
-                if sent and (done - last_write) > 1.6 * fr.duration_ms / 1000.0:
-                    s["late"] += 1
-                last_write = done
+                avg = sum(self._build_hist) / len(self._build_hist)
                 s.update(points=len(fr.points), frame_ms=fr.duration_ms, fps=fr.fps, measured=measured,
-                         effective=effective, online=len(online), live=sum(1 for p in online if not p.simulated))
+                         effective=effective, online=len(online), live=sum(1 for p in online if not p.simulated),
+                         extent=extent, boost=boost, peak_rgb=peak, build_ms=avg * 1000.0,
+                         build_max_ms=max(self._build_hist) * 1000.0, load=avg / period if period > 0 else 0.0)
+            if self._wthread is not None and c["armed"] and self.dac_ok:
+                self._taken.wait(0.1)                        # armed: the DAC's consumption paces us ...
+                self._taken.clear()                          # ... and when it is starved we simply run flat out
+            else:                                            # preview / safe: pace like the DAC would
+                time.sleep(max(0.0, min(0.1, period - (time.monotonic() - now))))

@@ -17,6 +17,7 @@ next to this file, ./lib, the current directory, /usr/local/lib, /opt/homebrew/l
 from __future__ import annotations
 
 import atexit
+import collections
 import ctypes
 import os
 import platform
@@ -103,6 +104,20 @@ class HeliosDAC:
         self._lib = None
         self._opened = False
         self._closed = False
+        # USB timing, last 120 frames: how long each frame waited for the DAC to be ready, how many status polls
+        # that took, and how long WriteFrame itself took. Tells a slow USB path from a slow computer.
+        self._t_ready = collections.deque(maxlen=120)
+        self._t_polls = collections.deque(maxlen=120)
+        self._t_write = collections.deque(maxlen=120)
+
+    def stats(self) -> dict:
+        """Averages/maxima (ms) over the last <=120 frames; all zeros before the first frame."""
+        ready, polls, write = tuple(self._t_ready), tuple(self._t_polls), tuple(self._t_write)   # snapshots: the writer appends meanwhile
+        def avg(d): return 1000.0 * sum(d) / len(d) if d else 0.0
+        def mx(d): return 1000.0 * max(d) if d else 0.0
+        return {"ready_ms": avg(ready), "ready_max_ms": mx(ready),
+                "polls": (sum(polls) / len(polls)) if polls else 0.0,
+                "write_ms": avg(write), "write_max_ms": mx(write)}
 
     # -- lifecycle ----------------------------------------------------------
     def open(self) -> "HeliosDAC":
@@ -194,9 +209,10 @@ class HeliosDAC:
             self._lib.Stop(self.device)
 
     def write(self, points: Iterable[Tuple[int, int, int, int, int]], pps: int,
-              timeout: float = 1.0) -> None:
+              timeout: float = 1.0, assume_ready: bool = False) -> None:
         """Send one frame of (x12, y12, r8, g8, b8) points. Blocks until the DAC can accept
-        it. Played once (SINGLE_MODE) -- the caller must keep supplying frames."""
+        it (unless the caller has just returned from wait_ready: assume_ready=True). Played once
+        (SINGLE_MODE) -- the caller must keep supplying frames."""
         if not self._opened or self._closed:
             raise HeliosError("DAC is not open")
         pts = list(points)
@@ -207,8 +223,25 @@ class HeliosDAC:
             raise HeliosError(f"pps {pps} out of range")
         buf = b"".join(_PACK.pack(x, y, r, g, b, 255) for (x, y, r, g, b) in pts)   # i=255: "unused"
         arr = (HeliosPoint * n).from_buffer_copy(buf)
+        if not assume_ready:
+            self.wait_ready(timeout)
+        t0 = time.perf_counter()
+        rc = self._lib.WriteFrame(self.device, pps, HELIOS_FLAGS_SINGLE_MODE,
+                                  ctypes.cast(arr, ctypes.POINTER(HeliosPoint)), n)
+        self._t_write.append(time.perf_counter() - t0)
+        if rc != 1:
+            raise HeliosError(f"WriteFrame failed: {describe_error(rc)} ({rc})")
+
+    def wait_ready(self, timeout: float = 1.0, poll_s: float = 0.0005) -> None:
+        """Block until the DAC can take another frame. Separate from write() so a caller can choose WHICH frame
+        to send at the last moment (the newest one) instead of committing to one before waiting."""
+        if not self._opened or self._closed:
+            raise HeliosError("DAC is not open")
+        t0 = time.perf_counter()
         deadline = time.monotonic() + timeout
+        polls = 0
         while True:
+            polls += 1
             st = self._lib.GetStatus(self.device)
             if st == 1:
                 break
@@ -216,11 +249,9 @@ class HeliosDAC:
                 raise HeliosError(f"GetStatus failed: {describe_error(st)}")
             if time.monotonic() > deadline:
                 raise HeliosError("timed out waiting for the DAC to become ready")
-            time.sleep(0.0005)
-        rc = self._lib.WriteFrame(self.device, pps, HELIOS_FLAGS_SINGLE_MODE,
-                                  ctypes.cast(arr, ctypes.POINTER(HeliosPoint)), n)
-        if rc != 1:
-            raise HeliosError(f"WriteFrame failed: {describe_error(rc)} ({rc})")
+            time.sleep(poll_s)
+        self._t_ready.append(time.perf_counter() - t0)
+        self._t_polls.append(polls)
 
 
 class DummyDAC:
@@ -233,8 +264,11 @@ class DummyDAC:
     def open(self) -> "DummyDAC":
         return self
 
-    def write(self, points, pps, timeout: float = 1.0) -> None:
+    def write(self, points, pps, timeout: float = 1.0, assume_ready: bool = False) -> None:
         time.sleep(max(0.0, len(list(points)) / float(pps) - 0.001))
+
+    def stats(self) -> dict:
+        return {}
 
     def stop(self) -> None:
         pass

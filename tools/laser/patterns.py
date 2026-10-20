@@ -206,6 +206,7 @@ def _build(strokes: List[Stroke], step: float, intensity: float, cal: Calib):
         for _ in range(cal.settle):
             blank(start)
         dwell = 1 if s.smooth else cal.corner_dwell
+        flat = None if cols else drive(s.color)            # one colour for the whole stroke: convert it once
         for _ in range(dwell):
             lit(start, cols[0] if cols else s.color)
         for j, (a, b) in enumerate(zip(s.pts, s.pts[1:])):
@@ -214,9 +215,14 @@ def _build(strokes: List[Stroke], step: float, intensity: float, cal: Calib):
             length = _dist(a, b)
             seg_lengths.append(length)
             n = max(1, math.ceil(length / step))
-            for k in range(1, n + 1):
-                f = k / n
-                lit(_lerp(a, b, f), _lerp3(ca, cb, f) if cols else ca)
+            if flat is not None:
+                for k in range(1, n + 1):
+                    p = _lerp(a, b, k / n)
+                    pts.append((p[0], p[1], flat[0], flat[1], flat[2]))
+            else:
+                for k in range(1, n + 1):
+                    f = k / n
+                    lit(_lerp(a, b, f), _lerp3(ca, cb, f))
             for _ in range(dwell - 1):
                 lit(b, cb)
         cur = s.pts[-1]
@@ -228,6 +234,28 @@ def _build(strokes: List[Stroke], step: float, intensity: float, cal: Calib):
     for _ in range(cal.settle):
         blank((0.0, 0.0))
     return pts, seg_lengths
+
+
+def _base_layout(strokes: List[Stroke], cal: Calib):
+    """What _build(strokes, step=1e9, ...) would return as (len(points), seg_lengths), without building the points:
+    the search for the right point spacing needs only these two numbers."""
+    settle = cal.settle
+    total = settle
+    seg_lengths: List[float] = []
+    cur: Point2 = (0.0, 0.0)
+    ceil = math.ceil
+    for s in strokes:
+        if len(s.pts) < 2:
+            continue
+        start = s.pts[0]
+        dwell = 1 if s.smooth else cal.corner_dwell
+        total += max(1, ceil(_dist(cur, start) / cal.travel_step)) + settle + dwell + settle
+        for a, b in zip(s.pts, s.pts[1:]):
+            seg_lengths.append(_dist(a, b))
+            total += dwell                                  # 1 sample per segment + (dwell - 1) corner dwells
+        cur = s.pts[-1]
+    total += max(1, ceil(_dist(cur, (0.0, 0.0)) / cal.travel_step)) + settle
+    return total, seg_lengths
 
 
 def _shift_colors(pts, n: int):
@@ -254,12 +282,17 @@ def render(strokes: List[Stroke], view: View, pps: int, target_ms: float = 30.0,
     for s in strokes:
         final.append(Stroke([view.apply(x, y) for x, y in s.pts], s.color, s.smooth, s.colors))
 
-    base_pts, seg_lengths = _build(final, 1e9, view.intensity, cal)          # 1 sample per segment
-    base = len(base_pts)
+    base, seg_lengths = _base_layout(final, cal)                              # 1 sample per segment
     on_length = sum(seg_lengths)
+    ceil = math.ceil
 
     def count(step: float) -> int:
-        return base + sum(max(1, math.ceil(L / step)) - 1 for L in seg_lengths)
+        total = base
+        for L in seg_lengths:
+            n = ceil(L / step)
+            if n > 1:                                      # (== max(1, ceil(L/step)) - 1, without the calls)
+                total += n - 1
+        return total
 
     target = int(max(20, min(HELIOS_MAX_POINTS, pps * target_ms / 1000.0)))
     over_budget = False
@@ -332,7 +365,25 @@ def _u8(v: float) -> int:
 
 def to_dac(frame: Frame) -> List[Tuple[int, int, int, int, int]]:
     """Float frame -> (x12, y12, r8, g8, b8) tuples for the Helios driver."""
-    return [(_u12(x), _u12(y), _u8(r), _u8(g), _u8(b)) for x, y, r, g, b in frame.points]
+    out: List[Tuple[int, int, int, int, int]] = []
+    append = out.append
+    lr = lg = lb = None
+    cr = cg = cb = 0
+    for x, y, r, g, b in frame.points:
+        px = round((x + 1.0) * 0.5 * 4095)
+        py = round((y + 1.0) * 0.5 * 4095)
+        if px < 0: px = 0
+        elif px > 4095: px = 4095
+        if py < 0: py = 0
+        elif py > 4095: py = 4095
+        if r != lr or g != lg or b != lb:                  # a stroke has one colour for many points: convert it once
+            cr = round(r * 255); cg = round(g * 255); cb = round(b * 255)
+            cr = 0 if cr < 0 else (255 if cr > 255 else cr)
+            cg = 0 if cg < 0 else (255 if cg > 255 else cg)
+            cb = 0 if cb < 0 else (255 if cb > 255 else cb)
+            lr, lg, lb = r, g, b
+        append((px, py, cr, cg, cb))
+    return out
 
 
 # ---- patterns ---------------------------------------------------------------

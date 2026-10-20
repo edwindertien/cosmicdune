@@ -56,7 +56,7 @@ from dataclasses import dataclass, field
 
 from flask import Flask, Response, abort, jsonify, request, send_file
 from pythonosc.dispatcher import Dispatcher
-from pythonosc.osc_server import ThreadingOSCUDPServer
+from pythonosc.osc_server import BlockingOSCUDPServer
 
 # Chart.js is served from a copy next to this script. There is deliberately
 # NO CDN fallback: this has to work with no internet (a Pi running its own
@@ -233,7 +233,9 @@ class Dashboard:
     def run_osc_server(self) -> None:
         disp = Dispatcher()
         disp.set_default_handler(self.on_message, needs_reply_address=True)
-        server = ThreadingOSCUDPServer(("0.0.0.0", self.osc_port), disp)
+        # ONE thread receives every datagram in turn (the handler only updates a dict). The threading server made a new
+        # thread per datagram -- ~450 a second with six pods -- which cost 2.6-2.9x the CPU on an x86 core, far more on a Pi.
+        server = BlockingOSCUDPServer(("0.0.0.0", self.osc_port), disp)
         threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
@@ -289,8 +291,8 @@ PAGE = r"""<!doctype html>
   .vbtn { position:absolute; right:8px; top:8px; height:28px; padding:0 10px; border-radius:8px; font-size:11px; font-weight:800;
           background:#262a31; border:1px solid var(--line); color:var(--dim); }
   .vbtn.on { background:#33507a; color:#fff; border-color:var(--acc); }
-  .vinfo { position:absolute; left:8px; bottom:6px; font-size:10px; color:var(--dim); font-variant-numeric:tabular-nums; }
-  .vmsg { position:absolute; left:8px; right:8px; bottom:24px; text-align:center; font-size:11px; color:var(--warn); }
+  .vinfo { position:absolute; left:8px; bottom:6px; max-width:calc(100% - 150px); font-size:10px; line-height:1.35; white-space:pre-wrap; color:var(--dim); font-variant-numeric:tabular-nums; }
+  .vmsg { position:absolute; left:8px; right:8px; bottom:38px; text-align:center; font-size:11px; color:var(--warn); }
   .vblack { position:absolute; right:8px; bottom:8px; height:44px; padding:0 16px; border-radius:10px; font-size:15px;
             font-weight:900; letter-spacing:.06em; background:#b02020; border:2px solid #ff8a8a; color:#fff; }
   .voff { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center;
@@ -839,11 +841,16 @@ function renderLaser(s) {
   $('btn-black').disabled = !s.laser || !s.can_control;
   $('panel-laser').classList.toggle('ro', !s.can_control);
   renderArm();
-  let info = s.points + ' pts  ' + s.frame_ms + ' ms  ' + s.fps + ' fps';
-  if (s.laser && s.mode === 'armed') info += '  late ' + s.late;
-  if (s.refused) info += '  refused ' + s.refused;
-  info += '  pods ' + s.pods_online + '/6 (live ' + s.pods_live + ')';
-  $('v-info').textContent = info;
+  // load = how much of each frame period the computer spends BUILDING a frame (100% = cannot keep up);
+  // rep = frames the DAC had to re-send because the next one was not ready; dark = times output stopped for lack of frames
+  let l1 = s.points + ' pts  ' + s.frame_ms + ' ms  ' + s.fps + ' fps  load ' + Math.round(100 * s.load) + '%';
+  if (s.laser && s.mode === 'armed') l1 += '  rep ' + s.late + (s.dark ? '  dark ' + s.dark : '');
+  if (s.refused) l1 += '  refused ' + s.refused;
+  // ext = how wide the lit pattern really is (full field = 2.0); (xN) = enlarged to keep it above --min-extent;
+  // rgb = peak 8-bit drive of each colour channel in the last frame
+  const l2 = 'ext ' + s.extent.toFixed(2) + (s.boost > 1.01 ? ' (x' + s.boost.toFixed(1) + ')' : '') +
+             '  rgb ' + s.peak_rgb.join('/') + '  pods ' + s.pods_online + '/6 live ' + s.pods_live;
+  $('v-info').textContent = l1 + '\n' + l2;
   if (!s.can_control) $('v-msg').textContent = 'view only: controls work from the hub\'s own screen';
   else if (s.error) $('v-msg').textContent = s.error;
   else if (s.mode === 'safe' && s.note && /auto-disarm|blackout|error/.test(s.note)) $('v-msg').textContent = s.note;
@@ -1003,6 +1010,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--max-size", type=float, default=0.6, help="the SIZE slider's ceiling (default 0.6)")
     g.add_argument("--auto-disarm", type=float, default=20.0, metavar="MIN",
                    help="disarm after this many minutes without any control activity (default 20; 0 = never)")
+    g.add_argument("--max-stale-ms", type=int, default=200, metavar="MS",
+                   help="with --laser: if no NEW frame has been built for this long while armed, the DAC is stopped (dark) "
+                        "instead of repeating the last frame (default 200; a slow computer re-sends the last frame "
+                        "to keep the laser lit, a stalled one goes dark)")
     g.add_argument("--allow-high", action="store_true", help="permit --max-intensity above 0.5")
     g.add_argument("--allow-remote-control", action="store_true",
                    help="with --laser, accept control (incl. ARM) from other machines too. DANGEROUS on an open hotspot")
@@ -1034,6 +1045,8 @@ def main(argv=None) -> int:
             errs.append(f"--scene must be one of: {', '.join(LV.SCENES)}")
         if args.auto_disarm < 0:
             errs.append("--auto-disarm cannot be negative")
+        if not 50 <= args.max_stale_ms <= 2000:
+            errs.append("--max-stale-ms must be 50-2000")
         if errs:
             print("error: " + "; ".join(errs), file=sys.stderr)
             return 2
@@ -1054,7 +1067,8 @@ def main(argv=None) -> int:
             args.pps, args.frame_ms, LP.PALETTES[args.palette], dac=dac, source=args.source, scene=args.scene,
             sync=args.sync if args.sync is not None else 0.0, sync_mode="hold" if args.sync is not None else "auto",
             max_intensity=args.max_intensity, max_size=args.max_size, auto_disarm_s=args.auto_disarm * 60.0,
-            bpm=args.bpm, tol_bpm=args.tol_bpm, demo_speed=args.demo_speed)
+            bpm=args.bpm, tol_bpm=args.tol_bpm, demo_speed=args.demo_speed, min_extent=args.min_extent,
+            max_stale_s=args.max_stale_ms / 1000.0)
         engine.start()
 
     local_ips = get_local_ips()
@@ -1067,6 +1081,9 @@ def main(argv=None) -> int:
     if not have_chart:
         print(f"\nNOTE: {CHART_JS_FILE} not found -- the graphs will be unavailable "
               "(no CDN fallback, by design: this must work offline). Tiles and numbers still work.")
+    if engine is not None:
+        if args.min_extent > 0:
+            print(f"Scenes never get narrower than {args.min_extent:g} (lit width, full field = 2.0; --min-extent, 0 = off).")
     if engine is None:
         print(f"\nNOTE: laser engine not loaded ({LASER_IMPORT_ERROR}) -- no visualiser, no controls.")
     elif dac is None:
@@ -1075,6 +1092,7 @@ def main(argv=None) -> int:
         print(f"\nLASER: DAC {dac.name or '(unnamed)'} firmware {dac.firmware} open, output SAFE (dark). "
               f"ARM on the touch screen. Limits: LEVEL <= {args.max_intensity}, SIZE <= {args.max_size}; "
               f"auto-disarm {'off' if not args.auto_disarm else f'after {args.auto_disarm:g} min'}; "
+              f"dark if no new frame for {args.max_stale_ms} ms; "
               f"controls from {'ANY machine (!)' if args.allow_remote_control else 'this machine only'}.")
 
     app = build_app(dashboard, engine, local_ips, have_chart, args.osc_port, args.allow_remote_control)
