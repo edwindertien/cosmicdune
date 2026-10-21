@@ -187,6 +187,20 @@ colour, note the **fraction of the line where it first becomes visible**. Then f
 `--blank-shift 2` if line starts/ends look wrong, and `--travel-step 0.03 --settle 6` if the
 galvos are noisy.
 
+### 5d. Is the USB link healthy? (once, on the Pi, still no light)
+
+The Helios can stop answering over USB while it plays. On a Pi 4 this was measured (see the README, "Feeding the DAC")
+and avoided with `--usb-polling timed`. Before relying on a Pi, let the tool look at it. The hub must be stopped; the output
+stays dark.
+
+```
+cd ~/cosmic-dune/tools && . .venv/bin/activate
+python laser/laser_test.py diag --seconds 60          # about 4 minutes; writes diag_<host>_<time>.txt
+```
+Copy the file to your Mac (`scp pi@<address>:~/cosmic-dune/tools/diag_*.txt .`) and read the SUMMARY at the top (or attach the file
+when asking for help). What good looks like: probes `ok`, idle polling `0 errors`, the `timed` stream test `0 failures`, and
+`throttled 0x0 (clean)`. If the DAC was just replugged, wait 10-15 s first.
+
 ## 6. The six circles converging -- with one real pod, from the touch screen
 
 Make sure `laser_test.py` is not running. Start the hub **with the laser**, using the calibration
@@ -197,6 +211,16 @@ cd ~/cosmic-dune/tools
 . .venv/bin/activate
 python osc_web_dashboard.py --laser --source fill --rgb-min R,G,B      # add --blank-shift N etc. as needed
 ```
+On a Pi 4 with the Helios the command that has run steadily is (the hub's own defaults are the cautious ones, so
+pass these yourself; `--allow-high` is needed for `--max-intensity` above 0.5):
+
+```
+python osc_web_dashboard.py --laser --usb-polling timed --intensity 0.4 --max-intensity 0.8 --allow-high \
+       --usb-log-file usb.log --auto-disarm 0 --rgb-min R,G,B
+```
+Add `--usb-recover-s 90` to let the hub reopen a DAC that stopped answering and carry on if the laser is still armed
+*(new; not yet confirmed on the real DAC)*. A `usb.log` that holds only its start-up header means there was no USB trouble.
+
 It prints `LASER: DAC ... open, output SAFE (dark)` and the limits. Then, **on the Pi's own touch
 screen** (with `--laser`, other devices get a view-only picture; that is deliberate -- the hotspot is
 open):
@@ -213,8 +237,10 @@ open):
    (`--max-intensity` 0.3, `--max-size` 0.6 unless you changed them) -- the server enforces them.
 
 The hub disarms itself after 20 minutes without any control activity (`--auto-disarm MIN`; `0`
-turns it off -- do that deliberately, for a show). A `LASER ERROR` chip means the DAC failed: restart
-the hub. The older route still works when the hub runs in *preview*:
+turns it off -- do that deliberately, for a show). A `LASER ERROR` chip means the DAC stopped answering or was
+unplugged and the hub gave up: look at `usb.log`, then restart the hub (or start with `--usb-recover-s` so it tries to reopen
+the DAC itself). The info line under the visualiser shows `load`, `sent`, `rep` (frames re-sent because the next one was late:
+harmless), `dark`, `usb err` and `reconnects`; the README explains each. The older route still works when the hub runs in *preview*:
 `python3 laser/laser_test.py show converge --dashboard --fill-demo`.
 
 ## If something doesn't work
@@ -233,14 +259,20 @@ the hub. The older route still works when the hub runs in *preview*:
 | hub: controls greyed, "view only" | you opened the page from another device while the hub runs with `--laser`; use the Pi's own screen |
 | hub: `ARM` says `NO LASER` | the hub was started without `--laser` |
 | hub: `No Helios DAC found` at start | USB / udev rule / group, or `laser_test.py` is holding the DAC |
-| hub: `LASER ERROR` chip | the DAC failed mid-run (unplugged?); restart the hub |
+| hub: `LASER ERROR` chip | the DAC stopped answering or was unplugged; read `usb.log`; restart the hub, or use `--usb-recover-s 90` so it reopens the DAC itself |
 | hub: laser went dark by itself | auto-disarm (default 20 min): re-ARM, or start with `--auto-disarm 0` |
-| hub: `late` grows while armed | the Pi 3 is too slow for engine + web + browser: `--frame-ms 40`, lower `--size`, close other tabs |
+| laser cuts out on small patterns (a lone spoke, a ring at its dot) | read the readout under the visualiser: `refused` up = our safety check, `rep` / `dark` up = the computer stalling, neither = the projector. Then try `--min-extent 0.2` (off by default), raise SIZE, or test a small `circle` at SIZE 0.10 |
+| hub: `load` near or above 100 %, or `rep` growing fast | the computer is too slow for engine + web + browser: `--viz-fps 15`, `nice -n 10` for the browser, governor `performance`, `--frame-ms 40`, lower `--size`; `--perf` shows where the CPU goes, `laser_test.py bench` the engine alone |
+| hub: `usb err` counts up; `GetStatus failed ... (-1002)` or `libusb error -7` | the DAC stopped answering for a moment: use `--usb-polling timed` (polling during playback is what triggered it), keep `--usb-log-file`, run `diag` and send the file; README "Feeding the DAC" |
+| laser dark for a few seconds, then back by itself (with `--usb-recover-s`) | the DAC went silent and the hub reopened it; `reconnects` counts it and `usb.log` has the story |
+| `probe` / the hub says `Unknown Helios 00` or `No Helios DAC found` right after a failure | the DAC is still silent: wait ~10 s or replug; `probe` shows when it answers again |
+| hub with `--laser`: "the laser code did not load" | a file in `laser/` is older than the others (for example `visuals.py`): copy all the files of one update together |
 
 ## Send me, after the first session
 
 1. the `check` table from the Pi (render times); 2. the `ramp` thresholds you read (R, G, B);
 3. whether `--blank-shift` helped and which value; 4. the hub's info line under the visualiser
-after a minute armed (`late` count); 5. whether the picture on screen matches the beam (shape,
+after a minute armed (`load`, `rep`, `dark`, `usb err`); 5. whether the picture on screen matches the beam (shape,
 orientation, timing) and whether anything was cramped or too small to hit on the touch screen;
-6. whether the hotspot survived a reboot.
+6. whether the hotspot survived a reboot; 7. the `usb.log` after any USB error (a header only is good news), or a
+`diag` file (step 5d).

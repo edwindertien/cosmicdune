@@ -553,14 +553,16 @@ both hand it to the DAC and publish it to the browser. So `osc_web_dashboard.py`
 `laser/engine.py` runs inside it. The earlier `laser_test.py show --dashboard` route (a second
 process polling `/api/summary`) was a stepping stone and still works against a hub in preview.
 
-**Engine** (`engine.py`). One thread loops: pods (live / fill / demo) -> scene or pattern ->
-`render` -> `validate` -> publish -> (if armed) `dac.write`. The browser gets the very same
+**Engine** (`engine.py`). Two threads (see "Keeping the DAC fed"): a producer loops: pods (live /
+fill / demo) -> scene or pattern -> `render` -> `validate` -> publish -> a one-slot mailbox; a writer
+sends the newest frame to the DAC while armed. The browser gets the very same
 (x12, y12, r8, g8, b8) points, after orientation, `--rgb-min` and blank shift, as an 8-byte header
 plus 8 bytes per point (about 5 KB a frame), long-polled so a frame arrives when it is produced.
 The page draws them with a fade (persistence of vision) and additive blending.
 
 **One thread owns the DAC.** The Helios library is not documented as thread-safe, so web handlers
-only set flags under a lock and the engine thread makes every call (write, stop, close). A blackout
+only set flags under a lock and the writer thread makes every call (wait, write, stop; `close` only
+after both engine threads have ended). A blackout
 is a flag, acted on within one frame (~30 ms) with a `Stop`; SINGLE_MODE means the laser is already
 going dark as frames stop.
 
@@ -579,7 +581,9 @@ going dark as frames stop.
   so a cross-site form post cannot trigger them. There is no real authentication.
 - Auto-disarm after `--auto-disarm` minutes (default 20) without control activity -- a deliberate
   fail-safe that will surprise someone mid-show; `0` disables.
-- A DAC error disarms and latches; the engine keeps previewing; the hub must be restarted.
+- USB errors: transient ones are ridden out for `--usb-grace-ms` and counted; a longer outage (or one the
+  SDK gives up on) disarms and latches an error, the engine keeps previewing, the hub must be restarted --
+  unless `--usb-recover-s` is set (reopen in place, resume if still armed; see "Timed pacing and USB recovery").
 - Only one program can hold the USB DAC (hub with `--laser` vs `laser_test.py`).
 
 **Bugs the browser tests found (all fixed)** -- the reason the page is tested in a real browser:
@@ -660,6 +664,140 @@ LIVE source: measured sync 0.0 scattered -> 0.99 converged -> 0.01 scattered; po
 layout flaws (clipped status text, wrapping "POD n") and one test-harness mistake. **Not tested:**
 simulator and real pods side by side, macOS loopback aliases, a hub on another machine over WiFi.
 
+### Minimum pattern size (cut-outs on small patterns)
+
+**Report.** With LEVEL 0.4 the colours and renders were right, but the laser "cuts out" at some moments,
+e.g. a spoke scene with a single spoke. The user's hypothesis: a galvo-lock safety (no motion, no laser) that
+might depend on intensity, so perhaps scale intensity per pattern.
+
+**What was established.** (1) A lone spoke is tiny: lit width 0.06-0.26 at SIZE 0.3 versus 0.48-0.60 for the
+test patterns that always worked; single-pod `converge`/`merge` 0.084-0.17. (2) Laserworld's FAQ (general
+to their lasers, not a CUBE 3 manual) says that in ILDA mode "a single beam or a very small pattern" can be
+blocked by the scan-fail safety, in a non-standard "full block mode", and advises a larger pattern: a SIZE
+trigger, with no mention of power. (3) **Our own validator was a second cause**: it refuses any frame whose
+lit area is under 0.04, and a refused frame means no output (fail-dark), so a lone spoke lost 35 of ~75
+frames at SIZE 0.10 and 17 at 0.15. (4) Late frames were not pattern-specific in a DAC model (a few rare
+dark gaps on any pattern from scheduling stalls). (5) No evidence of intensity dependence: **not built**.
+
+**Decision.** `visuals.fit_min_extent`: scenes (not test patterns, so small sizes can still be tried on
+purpose) are enlarged per frame, about the centre, whenever their lit width would drop below `--min-extent`
+(default 0.20 when it was built; **it is now OFF by default, `--min-extent 0.2` enables it**; the field is 2.0 wide). Per-frame and monotonic, so the width is continuous (largest step
+0.0024 between frames) with no pops. Verified: 90 scene x pods(1,6) x sync(0,0.5,1) x size(0.2,0.3,0.6)
+combinations, no frame below 0.20 and none refused; decoded from the actual DAC bytes for a lone spoke.
+**Flaw caught while testing:** the first version capped the enlargement at the SIZE slider's maximum (0.6,
+i.e. 2x of 0.3), which cannot lift a 0.084 dot to 0.20; the cap is now the full field, which is safe because
+an enlargement only happens when the pattern is small and its result is exactly the floor.
+
+**Trade-off.** At max sync every pod hits the dot together, so the floor flattens the pulse exactly where it
+is most wanted: `converge` (inherently small: 0.35 at its fullest at SIZE 0.3) pulses x1.7 at floor 0.20 and
+x1.2 at 0.30; `merge`/`ripple`/`bloom`/`spokes` keep x2.8. A lone pod flattens completely. The honest remedy
+for a bigger pulse is a bigger SIZE, not a lower floor.
+
+**Rejected.** *Pattern-dependent intensity as the cut-out fix*: unsupported by anything found, and if the
+trigger is size it would not help (lowering power for small patterns is a fine safety idea, and small rings
+are already dimmed, but that is a separate matter). *Invisible "keep-alive" mirror movement* to make the
+scanners look busy: it would trick a safety function meant to stop a concentrated small beam while the
+visible pattern stays just as small.
+
+**Diagnostics added:** the hub's info line 2 shows `ext` (lit width), `(xN)` (boost) and `rgb` (peak drive
+per channel; it also explains the earlier "mostly blue": at LEVEL 0.15 green was often 2-8/255), and
+`refused` / `late` already separate our causes from the projector's. **Not verified:** the actual CUBE 3
+threshold (unknown, hence `--min-extent` is a knob), whether the CUBE has a scan-fail mode setting, and the
+behaviour on the real laser.
+
+### Keeping the DAC fed: a producer, a writer and a slow computer
+
+**Report.** On a Pi 3 (less on a Pi 4) the data LED on the Helios showed irregular bursts; on the Mac it was
+almost constantly on. The Helios in `SINGLE_MODE` plays each frame once, so a starved DAC is a dark gap.
+
+**Cause.** One synchronous loop: build a frame, then block until the DAC is ready, then write. Nothing covered a
+late frame. Measured on an x86 core (converge, six pods): building one frame took 7.5 ms of a 27 ms period (28 %),
+two thirds of it the renderer (a 30-step bisection per frame re-scanning ~540 segments, and the frame built twice);
+the OSC server made a thread per datagram (~450 a second), 8.1 % of a core against 3.1 % single-threaded (2.6-2.9x).
+A Pi 3 core runs plain Python several times slower (an estimate, never measured here), hence >100 %.
+
+**Design.** A *producer* thread builds and publishes frames to a one-slot mailbox (latest wins); a *writer* thread owns
+the DAC, picks the newest frame at the last moment, **re-sends the last one** when none is newer (`rep`) and stops
+the DAC when nothing new arrived for `--max-stale-ms` (a stalled computer goes dark, never a frozen picture).
+Blackout / disarm / refused frames empty the mailbox or set a flag the writer acts on within a frame. The hub shows
+`load` (build time / frame period), `sent`, `rep`, `dark`.
+
+**CPU work.** The renderer was made about twice as fast (count-only first pass, one colour conversion per stroke, a
+plain loop for the counter, a leaner `to_dac`): converge 7.5 -> 3.8 ms. It is **bit-identical** to the old one, proven
+on 2,080 frames (every pattern, every scene with 1-6 pods, 1,200 random polylines with calibrations, and the DAC bytes).
+OSC is received on one thread. With CPU-hog processes standing in for slow boards (emulation, not a Pi), the old code
+was dark 16.8 % (Pi 4-like) and 60.3 % (Pi 3-like) of the time; the new one 0.0 % and 0.2 %.
+
+**What did not help (measured, so not repeated).** Lowering `--pps`: the frame cannot shrink below its geometry
+(~300 points for bloom); converge goes dotted at <=12000 and its frames stretch to 36-54 ms. The interpreter's
+thread-switch interval: no effect. Serving the page: about +4.5 points of a core at the full frame rate. A
+"learned polling" controller was built and parked once the data showed that the polling mode was not the lever.
+
+**As reported.** Pi 3: `bench` "keeps up" (twice); the whole hub with polling showed load 170-240 % and a
+`libusb error -7` after ~10 s. Pi 4: about 44-45 % load. Short frames raise `rep`: a fully converged `converge`
+frame is 19 ms (381 points) instead of 27-30 ms, so the builder has ~30 % less slack; 12 re-sent in 10,000 frames.
+
+### The USB investigation: Pi 3, Pi 4 and the Mac
+
+1. **Pi 3:** `GetStatus failed: libusb error -7` (a timeout) ~10 s into a run at 170-240 % load; one such error disarmed
+   the laser. Fix: classify errors as transient or fatal, ride transient ones out for 1 s.
+2. **Pi 4:** `GetStatus failed: USB control transfer failed (-1002)`. That is the SDK's *own* code (it hides libusb's
+   reason) and my classifier treated it as fatal, so the first one disarmed the laser -- a gap in my code.
+3. **Mac diagnostics:** the two polling modes made the same 7-8 polls per frame on the real DAC (a poll takes ~3 ms); my
+   "5 polls per frame" came from a model that did not match this DAC, and "0 vs 7 errors" was not evidence about polling.
+   libusb's log on the Mac: `transfer error: timed out` and pipe aborts; errors recovered within ~0.2 s.
+4. **Pi 4, first report:** both benches died at once; kernel log clean (the disconnects were the DAC being moved
+   between machines); the DAC at 12 Mbit/s behind the Pi's 480 Mbit/s hub with a 1.5 Mbit/s mouse; `Unknown Helios 00`
+   (name unreadable) after a failure; the Pi's SDK is a locally built `.so` that prints `Found new USB Helios DAC`, the
+   Mac's a prebuilt dylib that does not; `throttled 0x0`.
+5. **Pi 4, second report** (the decisive one): idle polling clean (1,724 polls, worst 4.9 ms); streaming with polling
+   failed after 11.1 s and 8.7 s, the DAC silent for 2.4 s each time, then recovered by itself; streaming on a fixed timer
+   without polling: 0 failures in 40 s. Every engine run showed exactly **50 failures in a row, ~21 ms apart, then -1000**:
+   the SDK closes its own handle after 50 consecutive errors, so retrying every 5 ms made the outage permanent.
+6. **Rejected hypotheses.** *A frame-boundary race:* the failing poll starts 20-40 % into the frame (timestamps minus the
+   failing call's duration), not at its end. *The 45-mod-64 frame size the SDK works around:* the failing frames were
+   560, 571, 591 points. *Power, heat, CPU, autosuspend, kernel resets:* all clean. *The mouse / shared translator:* never
+   isolated (the mouse stayed plugged in; the timed run was clean with it). *SDK build difference:* untested.
+   **Unverified idea:** after a timed-out transfer Linux's libusb does not reset the endpoint while Darwin's does (its log
+   says "aborting all transactions on pipe"), which would explain why the Mac recovers in 0.2 s and the Pi in seconds.
+7. **Mistakes on the way, kept here on purpose:** the polling model above; the bench said "keeps up" with zero frames
+   when a stale `visuals.py` killed the engine thread (it now says FAILED, and the engine refuses to import against a stale
+   `visuals.py`); my diag's hub detection used `pgrep -f` and could match an editor; the bench threw away the engine's
+   error log when it stopped at the first error (it now always reports it); seven older test files imported a stale copy
+   of the code for several rounds, so "all suites pass" was weaker than stated (found by an unrelated timing failure).
+
+### Timed pacing and USB recovery
+
+**`--usb-polling timed`** never asks the DAC "ready?". Each frame is written when the previous one was written plus its
+own duration plus `--frame-gap-ms` (1.5). Because the bulk transfer (~4 ms) overlaps the end of the previous frame's
+playback, the DAC idles about the gap between frames: ~5 % of the light. No status poll = nothing to trigger the stall.
+Cost: no queue slack, so a late wake-up is dark time (5.7 % for a realistic busy computer in the model, ~19 % in an
+extreme case: a renderer holding the interpreter lock for 90 ms). It is opt-in; the working Pi command passes it.
+*Result as reported:* 5 minutes / 10,000 frames, 12 re-sent, USB log empty; after 10-15 minutes one `-1002` outage that
+latched the error -- rarer, not gone.
+
+**Retry backoff** (5, 10, 20, then 40 ms between attempts) keeps the grace period at ~20 attempts instead of ~50.
+
+**`--usb-recover-s N` (opt-in).** On a persistent outage or an SDK `-1000`: laser dark, leave the DAC alone, `reopen()`
+it in place (`HeliosDAC.reopen`: close, then open again, which also sends `Stop`), verify with an idle status poll and
+a readable name, retry with backoff 0.5 s doubling to 5 s for up to N seconds, then resume if still ARMED, else latch
+"replug or restart". BLACKOUT/DISARM during the outage cancels the resume; errors a reopen cannot fix (access denied)
+latch at once; shutdown during recovery returns promptly. Why opt-in: it lets the laser come back without a tap.
+**Not verified on the real DAC:** the real SDK's in-process `CloseDevices` + `OpenDevices`. It is tested against a model
+(outage, SDK closing after N failures, reopen failing first) and a mock library, and in a real hub process.
+
+**The USB log** (`--usb-log-file`): every transient error with which call, ms after the last frame, frame size, how many in
+a row, plus each recovery, capped at 500 KB; the terminal shows a rate-limited copy. A header-only log = no USB trouble.
+
+### Defaults: tried and reverted
+
+Hub defaults of intensity 0.4, ceiling 0.8 and `timed` pacing, with the `--allow-high` gate moved from 0.5 to 0.8, were
+implemented and tested (including that the bench tools keep their timid defaults). After a report that it "does not seem to
+work" the user asked for the previous file and passes all flags by hand. My own comparison (a hub with only `--laser`
+against one with the explicit flags) gave identical state and identical DAC bytes (brightest colour 102/255), so the
+failure was not reproduced; the cause on the user's side was not found. The current hub keeps the cautious defaults
+(`--max-intensity` 0.3, gate at 0.5, `adaptive`); the defaults version is kept aside, not shipped.
+
 ### Lessons that cost time here
 
 - A timeout around a blocking call can't fire until the call returns -- find the
@@ -675,6 +813,19 @@ simulator and real pods side by side, macOS loopback aliases, a hub on another m
   to prove the test can fail.
 - `change` is not "the user finished": send on release and use a trailing-edge throttle.
 - Re-running a browser suite against long-lived servers pollutes it (state, logs); start fresh ones.
+- Measure on the real device before you design for it: a queue model of the DAC predicted 5 polls per frame; the real one made 8.
+  A test double that is not real-time (the mock) makes any threshold based on counts depend on machine speed.
+- A tool that gathers evidence must report it when it fails: the bench stopped at the first error and discarded the log that
+  would have answered the question. Never print a verdict ("keeps up") when nothing was measured.
+- A failure must be loud: a stale file next to a new one killed a thread silently. Check versions at import, never let a worker
+  thread die without a message, show the refusal reason on the page.
+- Test files can rot: point every suite at the code you deliver (seven pointed at a stale copy), and add the end-to-end test
+  that exercises what the user does (change controls WHILE ARMED and compare what the DAC receives).
+- Background browser tabs and a one-core machine starve timers: bring the page to the front, close finished pages, and test
+  "not early, not stuck" with a generous upper bound.
+- `pgrep -f name` matches editors and shells: match the executable and the script argument instead.
+- When a new default "does not seem to work", compare the two start-ups byte for byte before arguing; and ship the file the user
+  asks for.
 
 ## Current state (as of this writing)
 
@@ -683,18 +834,20 @@ both pulse timing modes, LittleFS persistence for both config files, the
 SH1107 display (monitor view + menu), the M5Stack encoder, the full build
 (`chain` + `lib_ignore`); the pod joining the Pi's hotspot (got 10.42.0.38) and
 OSC data reaching the dashboard on the Pi; the first round of laser test
-patterns (orientation, circle, orient, colors, linearity -- see "Laser").
+patterns (orientation, circle, orient, colors, linearity -- see "Laser"). Since then, reported by the user: the hub driving the
+real DAC on a Pi 4 + Helios + CUBE 3 in `timed` pacing (5 minutes, 10,000 frames, 12 re-sent), scenes at LEVEL 0.4 with all
+colours responding and a near 1:1 render; USB diagnostics (`diag`, `streamtest`) from a Pi 4, a Pi 3 bench and a Mac.
 
 **Written but untested (do not assume they work):**
 - Pod: WiFi non-blocking connect / give-up / `net retry` / watchdog with *no*
   network in range; the 19-item menu (WiFi Status, Net Retry).
 - Pi: the 800x480 tile + detail dashboard on the real touch screen; the
   hotspot's stability across reboots.
-- Laser: calibration flags, `ramp`, `show` and all five scenes (incl. `converge`),
-  the OSC and dashboard inputs, the Pi-side Helios build. Previewed and
-  mock-tested only.
-- The hub (dashboard + engine + visualiser + controls): headless-browser and mock-DAC tested
-  only. Not tried on the real DAC/laser, the Pi 3 or the real touch screen.
+- Laser: `show` (the bench-tool route), `--blank-shift`, and the pod-driven inputs with *real* pods (LIVE / FILL): not
+  reported. (Used on the real laser: the Pi-side Helios build, `ramp`, `--rgb-min`, LEVEL 0.4, and all five scenes through the
+  hub with demo / simulated pods.)
+- The hub's `--usb-recover-s` (reopen the DAC in place): tested against a model and a mock only; the real SDK's in-process reopen is
+  unverified. `--min-extent` on the real laser. The hub on the real 800x480 touch screen, and the Pi 3 with `timed` pacing.
 
 **Not built:** beat events from the pods, saving the hub's scene/levels across restarts, any
 real authentication on the hub's controls, Pi boot automation,
@@ -710,10 +863,18 @@ physical pods' `net pod` ids straight, menu submenu grouping.
   changes what "sync" means for the piece (rate vs. phase), which is an artistic
   as much as a technical decision. Telemetry is 15 Hz over WiFi, so beat timing
   would be good to tens of milliseconds, not better.
-- **The hub on the real hardware:** does the Pi 3 run engine + OSC + web server + Chromium without
-  late frames? Is the 800x480 layout comfortable to touch? Does the on-screen picture match the
-  beam (orientation, timing)? Is "controls only from this machine" enough, or does the show need
-  a PIN / physical key switch on the arm control?
+- **Why does the Helios go silent?** With polling it stops answering for ~2.4 s about once per ~2,000 polls; with `timed`
+  pacing it still happened once in 10-15 minutes (`-1002`). The first lines of that run's `usb.log` (which call, which frame
+  size) were never seen. Untested: unplugging the mouse (shared translator), an external hub, the SDK build (compare the Mac's
+  dylib with the Pi's `.so`: `diag --dry-run` on the Mac records the fingerprint), a libusb endpoint reset after a timeout.
+- **Does `--usb-recover-s` work on the real DAC** (the in-process reopen)? How long are real outages? Does `timed` survive an
+  hour-long soak (`--auto-disarm 0`)?
+- **The hub on the real hardware:** is the 800x480 layout comfortable to touch? Does the on-screen picture match the beam
+  (orientation, timing)? Does the Pi 3 keep up with `timed` pacing? Is "controls only from this machine" enough, or does the show
+  need a PIN / physical key switch on the arm control?
+- **The CUBE 3's real small-pattern threshold.** Test a `circle` at SIZE 0.10 (width 0.2) and the single
+  spoke at SIZE 0.6; compare LEVEL 0.15 and 0.4 (power-independent?); then set `--min-extent` just above the
+  largest width that still cut out.
 - Is the hotspot stable across reboots, and should it get a WPA2 password before
   the show?
 - The CUBE's safe `--pps` and scan size in ILDA mode; whether a Pi 3 renders and

@@ -346,14 +346,20 @@ Rules that matter:
 
 ### The hub: `tools/osc_web_dashboard.py` (dashboard + laser visualiser + controls)
 One process: receives the pods' OSC, runs the laser engine, serves one page built
-for the 800x480 touch screen. *(untested on the real screen and on the Pi; checked in
-a headless browser at exactly 800x480 against a mock DAC and simulated pods)*
+for the 800x480 touch screen. *(runs on a Pi 3 and a Pi 4 with the real Helios + CUBE 3, as reported;
+touch ergonomics on the real 800x480 screen not confirmed; the automated checks use a headless
+browser at exactly 800x480 against a mock DAC and simulated pods)*
 
 ```
 cd tools
 python osc_web_dashboard.py                  # PREVIEW: visualiser + dashboard, nothing sent to any laser
 python osc_web_dashboard.py --laser          # also drives the Helios DAC (starts SAFE; ARM on screen)
 python osc_web_dashboard.py --laser --source live --rgb-min 0.25,0.4,0.15 --auto-disarm 0
+# the command that has run steadily on a Pi 4 + Helios + CUBE 3 (all options are explained below; pass them yourself,
+# the hub's own defaults are the cautious ones):
+python osc_web_dashboard.py --laser --usb-polling timed --intensity 0.4 --max-intensity 0.8 --allow-high \
+       --usb-log-file usb.log --auto-disarm 0 --rgb-min R,G,B
+# + --usb-recover-s 90   to let the hub reopen a DAC that stopped answering (new, not yet confirmed on the real DAC)
 ```
 Run it as a script, **not** with `flask run` (the OSC listener and the engine are
 started by the script). The page works from `http://<the Pi>:5000`. Calibration and
@@ -400,9 +406,27 @@ the slider is its sync.
   overrides this -- do not use it on an open network.
 - Auto-disarm after `--auto-disarm` minutes (default 20; 0 = never) without any
   control activity; **set `--auto-disarm 0` for a show**, or it will go dark mid-show.
-- A DAC error disarms and latches an error (restart the hub); every frame is still
-  validated, and the DAC runs in fail-dark `SINGLE_MODE`. Control requests from the
+- USB trouble: a transient error (timeout, busy ...) is ridden out for `--usb-grace-ms` (default
+  1000) and counted. An outage longer than that, or one the SDK gives up on, disarms and latches
+  an error (restart the hub) -- unless you started with `--usb-recover-s`, which keeps the laser
+  dark, reopens the DAC and resumes if still ARMED (see "Feeding the DAC" below). Every frame is
+  still validated, and the DAC runs in fail-dark `SINGLE_MODE`. Control requests from the
   page are sent strictly in order (an old ARM can never overtake a newer BLACKOUT).
+
+**Minimum pattern size (`--min-extent`, OFF by default; 0.20 is the value to try).** When set, the scenes never get narrower than this lit
+width (the full scan field is 2.0 wide, so 0.20 is 10 % of it): when a pattern would be smaller, the
+*whole pattern is enlarged* for that frame, smoothly, and never beyond the full field. It matters most at
+**high sync**, when all six pulses hit their "dot" together. Reason: Laserworld's FAQ says the scan-fail
+safety of their lasers can block "a single beam or a very small pattern" (general to Laserworld, not a
+CUBE 3 manual; *unverified* for your unit), and a small pattern also concentrates the beam. Only scenes are
+affected; test patterns are drawn as asked. The price is a flatter pulse: at SIZE 0.3, `converge` at max
+sync pulses 0.20-0.35 wide (x1.7) instead of 0.084-0.35, a lone pod's spoke or ring hardly pulses, while
+`merge`, `ripple`, `bloom` and `spokes` keep x2.8. Raise it (e.g. `--min-extent 0.3`) if cut-outs persist,
+raise SIZE if you want the pulse back, `0` turns it off. The two-line readout under the visualiser shows
+what is really happening: line 2 is `ext` (the lit width now), `(xN)` when it was enlarged, and `rgb` (the
+peak 8-bit drive of each colour channel; a channel near 0 is why a colour is missing).
+*(Not yet tried on the real laser. In the one long run so far the converge scene's small moments showed up as a
+few re-sent frames, not as cut-outs -- see "Feeding the DAC".)*
 
 **Restarting the hub** resets what you chose on screen to the start-up defaults: source
 **DEMO**, scene `converge`, SYNC 0 in AUTO. To come back in another state, say so in the start
@@ -417,12 +441,70 @@ pushed as soon as it exists. In the (loaded) test VM the drawing was at the engi
 frame at the median, within 2-3 frames (60-90 ms) 90 % of the time, with occasional
 spikes of 4-6 frames. The DAC plays a frame about one frame after the engine
 produces it, so expect the picture and the laser to differ by tens of milliseconds
-at most. *(Pi 3: untested)*
+at most. *(measured in the test VM only, not on a Pi)*
 
 For debugging with curl: `/api/summary`, `/api/pod/<id>`, `/api/data`, `/api/info`,
 `/api/laser/state`, `/api/laser/frame.bin?since=<seq>` (8-byte header + 8 bytes per
 point, the same x12/y12/r/g/b the DAC gets), `POST /api/laser/control` (JSON, needs
 the header `X-Cosmic: 1`).
+
+### Feeding the DAC: the info line, pacing, USB errors, recovery
+
+**The info line** (two lines under the visualiser) -- what the numbers mean:
+
+| field | meaning |
+|---|---|
+| `pts`, `ms`, `fps` | the current frame: points, how long the DAC plays it, frames per second |
+| `load` | the share of a frame's duration the computer needs to *build* the next one (100 % = it cannot keep up) |
+| `sent` | frames handed to the DAC so far; it must keep rising while armed |
+| `rep` | frames **re-sent** because the next one was not ready in time: the picture holds for one frame and the laser stays lit. Not a missed frame. A few per thousand are normal; they cluster when frames get short (a fully converged `converge` frame is 19 ms instead of 27-30 ms, so the builder has about 30 % less slack) |
+| `dark` | times the output stopped because no new frame arrived for `--max-stale-ms` (200): a stalled computer goes dark, never a frozen picture |
+| `usb err`, `reconnects` | transient USB errors survived; times the DAC was reopened by `--usb-recover-s` |
+| `refused` | frames the safety check refused (the laser goes dark at once; the reason is shown on the picture) |
+| line 2: `ext`, `rgb`, `pods` | lit width of the pattern now (full field = 2.0; `(xN)` = enlarged by `--min-extent`); the peak 8-bit drive of each colour channel; pods online / live |
+
+**How frames reach the DAC.** Two threads. The *producer* builds frames (pods -> scene -> render ->
+validate), publishes them to the browser and leaves the newest in a one-slot mailbox; it never touches
+the DAC. The *writer* is the only thread that does: if the producer is late it re-sends the last frame
+(`rep`), and if nothing new arrives for `--max-stale-ms` it stops the DAC (dark). Blackout, disarm and
+error handling are acted on by the writer within a frame. Before this split a late frame on a slow
+computer was a dark gap (the Helios plays each frame once); on an emulated Pi 3 the old loop was dark
+60 % of the time, the new one 0.2 %.
+
+**Pacing: `--usb-polling`.** `adaptive` (the default) and `fast` ask the DAC "ready?" over USB before
+each frame. **`timed`** never asks: it writes each frame on a fixed schedule (the frame's own duration
+plus `--frame-gap-ms`, default 1.5, so the DAC idles about 5 % of the time between frames and you give
+up about 5 % of the light). `timed` has no queue to absorb a late wake-up, so lateness becomes dark time
+(5.7 % for a realistic busy computer in the model, about 19 % in an extreme case).
+
+**What was measured on a Raspberry Pi 4 + Helios** (the DAC at 12 Mbit/s behind the Pi's 480 Mbit/s hub,
+shared with a 1.5 Mbit/s mouse; throttling, voltage, heat, CPU and kernel log all clean):
+- polling the DAC while idle (no frames): 1,724 polls, no error.
+- streaming dark frames **and polling before each frame**: the DAC stopped answering after 11 s and 9 s, for
+  2.4 s each time, then recovered by itself. The engine, retrying every 5 ms, made 50 failed calls in a row
+  within about a second -- which is when the SDK closes its own handle ("Closing Helios DAC: too many
+  errors", then `-1000` for good). The retries now back off (5, 10, 20, 40 ms).
+- streaming the same frames **on a fixed timer without polling**: no failure in 40 s; the hub then ran 5 minutes /
+  10,000 frames with 12 re-sent. After 10-15 minutes a `-1002` outage still happened: `timed` made it much
+  rarer, not impossible.
+- the Mac with the same DAC shows the same kind of timeouts (about 7 per minute while polling constantly) but
+  recovers within ~0.2 s; the Pi's lasted seconds.
+- **Not known:** why the DAC goes silent; whether the hub's shared transaction translator matters (the mouse
+  was never unplugged for a test); `-1002` is the SDK's own "USB control transfer failed" and hides libusb's
+  reason. Frame size is not implicated (the failing frames were 560, 571 and 591 points).
+
+**USB errors in the hub.** Transient errors (`-7` timeout, `-1002` control transfer failed, busy, interrupted)
+are ridden out for `--usb-grace-ms` and counted. Every one is written, with context, to `--usb-log-file`: which
+call, how long after the last frame, the frame size, how many in a row, and each recovery; the terminal
+shows a rate-limited copy. **A log that holds only its start-up header means there was no USB trouble.**
+
+**Recovery: `--usb-recover-s SECONDS`** (off by default; *new, only tested against a model and a mock DAC, not yet on
+the real one*). When errors outlast the grace period, or the SDK has closed the device, the writer keeps the laser
+dark, leaves the DAC alone, reopens it in place (backoff 0.5 s doubling to 5 s), checks that it answers a status
+request (safe: it is idle) and resumes if the laser is still ARMED. After the limit it gives up: error latched, SAFE,
+"replug the DAC or restart the hub". BLACKOUT or DISARM during an outage cancels the resume; errors a reopen cannot
+fix (e.g. access denied) still latch at once. The page shows `DAC not answering: laser DARK, reconnecting (3.2 s of 90)`.
+It is opt-in because it lets the laser come back on without a tap.
 
 ### Test tools: `tools/osc_test_hub.py`
 `pip install -r tools/requirements.txt`, then:
@@ -564,6 +646,8 @@ calibration options themselves are *(untested)* on the real laser.
   `--travel-step 0.03 --settle 6`.
 - `--pps` (default 20000): raise to 25000-30000 if corners stay sharp; lower if
   `square`/`star` come out rounded.
+- `--min-extent X` (default 0.2): scenes are enlarged whenever the lit pattern would be narrower than X
+  (full field = 2.0). Hub and `laser_test.py show` both honour it; `0` = off.
 - Orientation: `--flip-x --flip-y --swap-xy --rotate DEG --offset-x/-y`.
 
 ### Pod visuals: `show <scene>` *(untested on the real laser)*
@@ -602,6 +686,23 @@ At 20 kpps the busiest states (six large rings) take about 33 ms per frame; if
 they flicker, raise `--pps` or lower `--size`. Rendering took 1-6 ms per frame
 on the small Linux VM used for testing; on a Mac and on the Pi 3 it is *(untested)*.
 
+### Is the USB link healthy? `probe`, `usbtest`, `streamtest`, `bench`, `diag`
+
+All of these keep the output **dark** (no light is emitted) and need the DAC to themselves: stop the hub first.
+
+| command | what it tells you |
+|---|---|
+| `probe` | finds the DAC and reads its name and firmware (control path only). A name of `Unknown Helios 00` means the DAC is not answering right now |
+| `usbtest [--seconds 10 --interval-ms 3]` | asks "ready?" in a loop with **no frames at all**. Clean = the control path is fine; failing = the USB path, the DAC or the SDK build, not frames or polling modes |
+| `streamtest --mode poll\|timed [--poll-at F]` | streams dark fixed-size frames without the engine; at the first failure it leaves the DAC alone and measures how long it stays silent and whether it recovers unaided (reopening it if the SDK closed it). `timed` never polls; `--poll-at 0.5` adds one poll per frame at that point in the frame |
+| `bench [scene] --usb-polling adaptive\|fast\|timed` | the hub's real pipeline with the colours forced to zero: load, share of frames delivered, USB errors per minute, time of the first error, longest error run, error kinds and events, and a verdict: `keeps up`, `does NOT keep up`, or `UNRELIABLE` (never "keeps up" when no frames got through). USB errors never latch inside the bench |
+| `diag [--seconds 60]` | everything above in one go, written to one small file (under 24 KB, summary first): system facts (board, OS, clock, throttling and under-voltage history), the DAC's hub and what else shares it, the SDK library's fingerprint, three probes, idle polling at 3 and 30 ms, two stream tests, interleaved bench rounds (`--bench-modes adaptive,timed`) and the relevant kernel log lines. It waits for the DAC to answer again between stages and reports how long that took |
+
+To get a report to someone else: stop the hub, run `python laser/laser_test.py diag --seconds 60` on the Pi, copy the
+`diag_<host>_<time>.txt` to your Mac (`scp pi@<address>:<path> .`) and attach the file. `--libusb-debug 4 --seconds 10
+--rounds 1 --idle-seconds 5` adds libusb's own transfer status codes (-71 bus error, -32 stall, ...) without root;
+`--dry-run` tries the tool without a DAC.
+
 ## Known unverified assumptions
 
 Pod firmware and hardware:
@@ -627,13 +728,15 @@ Pod firmware and hardware:
   core version.
 
 Pi and hub:
-- **The 800x480 hub on the real touch screen:** touch ergonomics, the Chromium
-  kiosk, and Pi 3 performance (the engine, the OSC listener, the web server and
-  Chromium share one small computer; a late frame is a flicker). Layout, clicks,
-  drags, ARM/BLACKOUT and the control-ordering fix were checked in a headless
-  browser against a mock DAC.
-- **The hub driving the real DAC:** `--laser`, ARM/BLACKOUT and the auto-disarm have
-  only been exercised against a mock Helios library.
+- **The 800x480 hub on the real touch screen:** touch ergonomics and the Chromium
+  kiosk. Layout, clicks, drags, ARM/BLACKOUT and the control-ordering fix are checked in a
+  headless browser against a mock DAC. On a Pi 3 the engine alone "keeps up" (`bench`), but the
+  whole hub with polling pacing showed 170-240 % load; the Pi 3 with `timed` pacing has not been
+  measured. A Pi 4 runs the hub at about 45 % load (as reported).
+- **The hub driving the real DAC** works on a Pi 4 + Helios + CUBE 3 in `timed` mode (5 minutes, 10,000
+  frames, 12 re-sent). Not confirmed: runs longer than 10-15 minutes without a USB outage,
+  `--usb-recover-s` on the real SDK (the reopen is tested only against a model and a mock),
+  the auto-disarm on the hardware, and `--min-extent`. The cause of the rare DAC silences is unknown.
 - **Hotspot stability across reboots.** The cause of the earlier
   start/vanish/rejoin-home-WiFi flapping was not pinned down; the single-profile
   recipe above is the recommended fix, not a confirmed one.
@@ -642,8 +745,8 @@ Laser:
 - **Everything after the first bench round** (calibration flags, `ramp`, `show`,
   `converge`, the OSC and dashboard inputs, the corrected Pi build line) has only been run against a mock
   Helios library, a real SDK build with no DAC attached, and rendered previews.
-- Whether the diode-threshold explanation for `sweep`/`rays` is right; `ramp`
-  measures it.
+- The diode-threshold explanation for `sweep`/`rays`: in practice low drive was the cause (all
+  colours respond at LEVEL 0.4); the per-channel drive is on the `rgb` readout.
 - The CUBE's own ILDA scan size/amplitude and its safe `--pps`.
 
 **Resolved, not concerns (kept here briefly since they looked like real
@@ -660,8 +763,7 @@ on the hotspot was its CDN dependency. See `context.md` for each story.
 
 ## Deliberately deferred (not in this iteration)
 
-- **Hub polish:** the hub exists (dashboard + engine + visualiser + controls) but is
-  untested on the real laser and Pi. Not built: saving the chosen scene/levels across
+- **Hub polish:** the hub exists (dashboard + engine + visualiser + controls) and runs on a Pi with the real laser. Not built: saving the chosen scene/levels across
   restarts, a sync *measurement* that uses beat events (below), and any
   authentication beyond "controls only from this machine".
 - **Beat events from the pods** (a small firmware addition: send a message at
